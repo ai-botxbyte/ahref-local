@@ -1,0 +1,24 @@
+# Build / deploy artifacts
+.serverless/
+.build_tag
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Downloaded / generated
+downloaded_files/
+*.log
+
+# Local secrets (just in case)
+.env
+.env.*
+proxies.txt
+/tmp/proxies.txt
+
+# K8s (internal)
+k8s/
+
+# Large test outputs
+results_500.json
+results_500.summary.json
