@@ -1,0 +1,15 @@
+{
+  "os": "Linux 6.17.0-29-generic",
+  "workers": 6,
+  "headless": false,
+  "total": 1,
+  "ok": 1,
+  "failed": 0,
+  "wall_clock_seconds": 19.06,
+  "wall_clock_minutes": 0.32,
+  "avg_seconds_per_domain": 19.06,
+  "throughput_domains_per_min": 3.15,
+  "started_at": "2026-06-01T06:08:48.293591+00:00",
+  "finished_at": "2026-06-01T06:09:07.355283+00:00",
+  "results_file": "/home/sanket777/Desktop/Botxbyte/ahref-lambda/results_uc.json"
+}

@@ -1,0 +1,4 @@
+# Cross-platform Ahrefs scraper (Windows + Linux + macOS)
+# Install with:  pip install -r requirements_uc.txt
+undetected-chromedriver>=3.5.5
+selenium>=4.20.0
