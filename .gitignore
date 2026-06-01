@@ -22,3 +22,5 @@ k8s/
 # Large test outputs
 results_500.json
 results_500.summary.json
+serverless.yml
+.serverless.yml
