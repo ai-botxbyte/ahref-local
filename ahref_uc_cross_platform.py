@@ -251,6 +251,9 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
     import undetected_chromedriver as uc
 
     opts = uc.ChromeOptions()
+    # "eager" = don't wait for subresources/iframes (fixes Windows hang
+    # where Turnstile iframe keeps page in "loading" state forever)
+    opts.page_load_strategy = "eager"
     profile = worker_profile_dir(worker_id)
     opts.add_argument(f"--user-data-dir={profile}")
     opts.add_argument("--no-first-run")
@@ -270,7 +273,7 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
 
     driver = uc.Chrome(options=opts, headless=headless, use_subprocess=True,
                        version_main=version_main)
-    driver.set_page_load_timeout(45)
+    driver.set_page_load_timeout(30)
     driver.set_script_timeout(120)
     return driver
 
@@ -298,10 +301,18 @@ def scrape_one(worker_id: int, domain: str, headless: bool, chrome_binary: Optio
 
         driver = build_driver(worker_id, headless=headless, chrome_binary=chrome_binary,
                               version_main=version_main)
-        driver.get("https://ahrefs.com/website-authority-checker/")
+        try:
+            driver.get("https://ahrefs.com/website-authority-checker/")
+        except Exception:
+            # On Windows, page load can timeout even with eager strategy
+            # if Turnstile blocks DOMContentLoaded — page is still usable
+            pass
 
-        # Brief wait for input (max 5s, not 10s)
-        deadline = time.time() + 5
+        # Give the SPA a moment to render (Windows is slower to paint)
+        time.sleep(2)
+
+        # Wait for input (max 10s — Windows needs more time)
+        deadline = time.time() + 10
         while time.time() < deadline:
             has_input = driver.execute_script(
                 "return !!document.querySelector(\"input[type='text']\")"
