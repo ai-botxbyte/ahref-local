@@ -251,17 +251,13 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
     import undetected_chromedriver as uc
 
     opts = uc.ChromeOptions()
-    # "eager" = don't wait for subresources/iframes (fixes Windows hang
-    # where Turnstile iframe keeps page in "loading" state forever)
     opts.page_load_strategy = "eager"
-    opts.add_argument("--guest")
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--disable-infobars")
     opts.add_argument("--start-maximized")
     opts.add_argument("--lang=en-US")
-    # Tile the windows so they don't all stack on top of each other
     col = worker_id % 3
     row = worker_id // 3
     opts.add_argument(f"--window-position={col * 720},{row * 560}")
@@ -270,9 +266,8 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
     if chrome_binary:
         opts.binary_location = chrome_binary
 
-    profile = worker_profile_dir(worker_id)
     driver = uc.Chrome(options=opts, headless=headless, use_subprocess=True,
-                       version_main=version_main, user_data_dir=profile)
+                       version_main=version_main)
     driver.set_page_load_timeout(30)
     driver.set_script_timeout(120)
     return driver
