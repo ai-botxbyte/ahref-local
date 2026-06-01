@@ -266,8 +266,11 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
     if chrome_binary:
         opts.binary_location = chrome_binary
 
+    # Use a fresh temp profile via UC's constructor (avoids profile lock crash
+    # when another Chrome is open, and avoids the profile picker dialog)
+    profile = worker_profile_dir(worker_id)
     driver = uc.Chrome(options=opts, headless=headless, use_subprocess=True,
-                       version_main=version_main)
+                       version_main=version_main, user_data_dir=profile)
     driver.set_page_load_timeout(30)
     driver.set_script_timeout(120)
     return driver
