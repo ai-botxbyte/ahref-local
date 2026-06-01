@@ -1,0 +1,10 @@
+{
+  "name": "ahref-lambda-service",
+  "version": "1.0.0",
+  "description": "Ahrefs Website Authority Checker — Lambda container image (UC + Xvfb)",
+  "main": "lambda_handler.py",
+  "scripts": {
+    "deploy": "sls deploy --function ahrefWorker1 || sls deploy"
+  },
+  "license": "ISC"
+}

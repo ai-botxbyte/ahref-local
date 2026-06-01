@@ -1,0 +1,49 @@
+# Kubernetes container image — Chrome + Xvfb + FastAPI
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    USE_XVFB=1 \
+    HOME=/tmp \
+    XDG_CACHE_HOME=/tmp/.cache \
+    XDG_CONFIG_HOME=/tmp/.config
+
+# System deps + Chrome runtime libs + Xvfb + xdotool + FULL font packs
+# (Cloudflare fingerprints via canvas/font enumeration — stripped-down
+#  fonts is one of the strongest "headless container" tells).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget curl ca-certificates gnupg unzip \
+        xvfb xdotool x11-utils \
+        fonts-liberation fonts-dejavu fonts-noto fonts-noto-cjk \
+        fonts-noto-color-emoji fonts-roboto fonts-freefont-ttf \
+        libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+        libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+        libxrandr2 libgbm1 libasound2 libpango-1.0-0 libpangocairo-1.0-0 \
+        libgtk-3-0 libx11-xcb1 libxcb-dri3-0 \
+        mesa-utils libgl1-mesa-dri libegl1 \
+        pulseaudio-utils alsa-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Google Chrome stable
+RUN curl -fsSLo /tmp/chrome.deb \
+        https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+ && rm -f /tmp/chrome.deb \
+ && rm -rf /var/lib/apt/lists/* \
+ && google-chrome --version
+
+ENV CHROME_BINARY=/usr/bin/google-chrome
+
+WORKDIR /app
+
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt \
+ && pip install --no-cache-dir fastapi uvicorn
+
+COPY lambda_handler.py ahrefs.json server.py /app/
+
+EXPOSE 8000
+
+CMD ["python", "-u", "server.py"]
