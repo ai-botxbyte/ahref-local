@@ -1,227 +1,144 @@
-# Ahrefs Domain Authority Checker — Local Browser Integration
+# Ahrefs Domain Authority Checker — Pull-Based Local Browser Processing
 
 ## Overview
 
-This feature replaces the previous AI Management Service → browser-agent-management-service pipeline for Ahrefs domain authority checks with a **direct HTTP call from the Kubernetes worker to a local machine** running the browser automation script.
-
-The local machine is exposed to the internet via a Cloudflare tunnel, allowing the k8s worker to send domains directly to your laptop for processing.
+Local script that pulls domains from the server queue, processes them in parallel browser instances, and posts results back. No tunnel or port-forwarding needed — the script makes outbound HTTP calls only.
 
 ---
 
-## Architecture
+## Architecture (Pull Approach)
 
-### Previous Flow (Removed)
 ```
-RabbitMQ (ahref.authority-checker-queue)
-    → Worker (k8s pod)
-    → AI Management Service (create task + poll for result)
-    → browser-agent-management-service (SeleniumBase)
-    → Browser
-```
-
-### New Flow
-```
-RabbitMQ (ahref.authority-checker-queue)
-    → Worker (k8s pod)
-    → HTTP POST /check (via Cloudflare tunnel)
-    → Local machine (ahref-lambda/ahrefs_checker.py)
-    → Single Chrome browser instance
-    → JSON response back to worker
-    → workflow.domain-final-queue
-```
-
----
-
-## Components Modified
-
-### 1. `ahref-lambda/ahrefs_checker.py`
-
-**What changed:** Added a FastAPI HTTP server mode alongside the existing CLI mode.
-
-**HTTP Server Mode (default):**
-- Runs on port 8000
-- Exposes `POST /check` endpoint
-- Accepts `{"domains": ["example.com", "github.com"]}`
-- Opens ONE browser instance, processes all domains sequentially
-- Returns structured JSON with DR, backlinks, linking websites, dofollow percentages
-- Thread-lock ensures only one browser check runs at a time (returns 503 if busy)
-- `GET /health` endpoint for monitoring
-
-**CLI Mode (--cli flag):**
-- Same as before, processes domains from file or single domain argument
-- Writes results to JSON file
-
-**Usage:**
-```bash
-# HTTP server mode (default)
-cd ahref-lambda
-.venv/bin/python ahrefs_checker.py --port 8000
-
-# With headless browser
-.venv/bin/python ahrefs_checker.py --port 8000 --headless
-
-# CLI mode
-.venv/bin/python ahrefs_checker.py --cli --domain example.com
-.venv/bin/python ahrefs_checker.py --cli --domains domains.txt --out results.json
-```
-
-**API Request/Response:**
-```json
-// POST /check
-// Request:
-{"domains": ["botxbyte.com", "github.com"]}
-
-// Response:
-{
-  "total_domains": 2,
-  "results": [
-    {
-      "domain_name": "botxbyte.com",
-      "status": "completed",
-      "dr": "0.2",
-      "backlinks": "123",
-      "linking_websites": "45",
-      "backlinks_dofollow_percentage": "80",
-      "linking_websites_dofollow_percentage": "60",
-      "elapsed_seconds": 19.5,
-      "finished_at": "2026-06-01T09:58:16.170567+00:00"
-    },
-    ...
-  ]
-}
+┌─────────────────────────────────────────────────────────┐
+│  Server (Kubernetes)                                     │
+│                                                          │
+│  Campaign created → ahref.authority-checker-queue        │
+│       ↑                              ↓                   │
+│  workflow.domain-final-queue    GET /ahref-authority/     │
+│       ↑                              ↓                   │
+│  POST /ahref-authority/  ←──── returns execution record  │
+└────────────────────────────────────────────────────────── ┘
+         ↑                              ↓
+         │         YOUR LAPTOP          │
+         │                              │
+         │    ┌──────────────────┐      │
+         └────│  Worker 0 (proxy)│←─────┘
+              │  Worker 1 (proxy)│
+              │  Worker 2 (proxy)│
+              │  Worker 3 (proxy)│
+              │  Worker 4 (proxy)│
+              └──────────────────┘
+              5 parallel Chrome instances
 ```
 
 ---
 
-### 2. `domain-metrics-orchestration-service/app/service/ahref_domain_authority_checker_service.py`
+## Commands
 
-**What changed:** Replaced AI Management Client + task polling with a single HTTP POST to the local ahref-lambda service.
-
-**Before:**
-- Created domain-matrix tasks via `AiManagementClient.create_domain_matrix_tasks()`
-- Polled for task completion with exponential backoff (up to 5 minutes)
-- Parsed `ahrefs_batch_results` from task variables
-
-**After:**
-- Single `httpx.post()` to `{AHREF_LOCAL_SERVICE_URL}/check` with `{"domains": [...]}`
-- Parses response directly
-- 300s timeout for the HTTP call (enough for browser processing)
-- Same output format (`ahrefs_domain_rating`, `ahrefs_backlinks`, etc.) for downstream workflow compatibility
-
-**Removed dependencies:** `AiManagementClient`, `poll_task_result`
-
----
-
-### 3. `domain-metrics-orchestration-service/app/config/config.py`
-
-**Added:**
-```python
-AHREF_LOCAL_SERVICE_URL: str = Field(
-    default="http://localhost:8000",
-    env="AHREF_LOCAL_SERVICE_URL",
-    description="Base URL for local Ahrefs checker HTTP service"
-)
-```
-
----
-
-### 4. `domain-metrics-orchestration-service/.env.dev`
-
-**Added:**
-```
-AHREF_LOCAL_SERVICE_URL=https://norfolk-finals-fed-give.trycloudflare.com
-```
-
----
-
-## Deployment Steps
-
-### 1. Start the local ahref-lambda server
+### Run with 5 instances + proxies (default)
 ```bash
 cd /home/sanket777/Desktop/Botxbyte/ahref-lambda
-.venv/bin/python ahrefs_checker.py --port 8000
+.venv/bin/python ahrefs_checker.py
 ```
 
-### 2. Expose via Cloudflare tunnel
+### Run without proxies (local IP)
 ```bash
-cloudflared tunnel --url http://localhost:8000
-# Note the generated URL (e.g., https://xxx-xxx-xxx.trycloudflare.com)
+.venv/bin/python ahrefs_checker.py --no-proxy
 ```
 
-### 3. Update .env.dev with tunnel URL
-```
-AHREF_LOCAL_SERVICE_URL=https://<your-tunnel-url>.trycloudflare.com
-```
-
-### 4. Git push and deploy
+### Run with custom number of instances
 ```bash
-cd domain-metrics-orchestration-service
-git add .env.dev app/config/config.py app/service/ahref_domain_authority_checker_service.py
-git commit -m "feat: ahref worker calls local ahref-lambda HTTP API directly"
-git push
+# 3 instances with proxies
+.venv/bin/python ahrefs_checker.py --workers 3
+
+# 1 instance, no proxy
+.venv/bin/python ahrefs_checker.py --workers 1 --no-proxy
+
+# 2 instances, no proxy, headless
+.venv/bin/python ahrefs_checker.py --workers 2 --no-proxy --headless
 ```
 
-### 5. Trigger GitHub Actions workflow
+### Run headless (no visible browser)
 ```bash
-gh workflow run deploy.yaml -f environment=dev -f workers_override=ahref_domain_authority_checker_worker
+.venv/bin/python ahrefs_checker.py --headless
 ```
 
-Or manually trigger from GitHub Actions UI:
-- Workflow: "Build and Deploy Workers to DO Kubernetes"
-- Environment: dev
-- workers_override: `ahref_domain_authority_checker_worker`
+### All options
+```bash
+.venv/bin/python ahrefs_checker.py \
+  --workers 5 \
+  --no-proxy \
+  --headless \
+  --api-url http://164.90.252.85/domain-metrics-management-service/api/v1 \
+  --chrome /usr/bin/google-chrome-stable \
+  --proxies proxies.txt
+```
 
 ---
 
-## Important Notes
+## Options Reference
 
-### Cloudflare Tunnel URL Changes
-The free `trycloudflare.com` tunnel generates a **random URL each time** you restart it. When you restart the tunnel:
-1. Get the new URL from cloudflared output
-2. Update `.env.dev` with the new URL
-3. Push and redeploy the worker
-
-For a persistent URL, set up a named Cloudflare tunnel with your domain.
-
-### Single Browser Instance
-- Only ONE browser check runs at a time (thread lock)
-- If the server receives a request while busy, it returns HTTP 503
-- The k8s worker has 4 replicas, but all will hit the same local server — they'll queue up naturally via the 503 + DLX retry mechanism
-
-### Browser Visibility
-- By default, the browser runs in headed mode (visible on your desktop)
-- Use `--headless` flag for headless operation
-- The browser opens fresh for each `/check` request and closes after all domains are processed
-
-### Monitoring
-- Local server logs: `/tmp/ahref_server.log` (if started with nohup)
-- Worker pod logs: `kubectl logs -l app=dm-orch-ahref-domain-authority-checker-worker -n domain-metrics`
-- Health check: `curl https://<tunnel-url>/health`
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--workers N` | 5 | Number of parallel browser instances |
+| `--no-proxy` | off | Disable proxies, all instances use local IP |
+| `--headless` | off | Run browsers in headless mode |
+| `--api-url URL` | (production) | Management service API URL |
+| `--chrome PATH` | auto-detect | Path to Chrome binary |
+| `--proxies FILE` | proxies.txt | Path to proxy list file |
 
 ---
 
-## Testing
+## Proxy Format
 
-### Quick local test
-```bash
-curl -X POST http://localhost:8000/check \
-  -H "Content-Type: application/json" \
-  -d '{"domains": ["example.com", "github.com"]}'
+File: `proxies.txt` (one per line)
+```
+ip:port:username:password
 ```
 
-### Full integration test
-1. Start server + tunnel
-2. Create campaign in domain-metrics-management with a domain and ahref workflow
-3. Watch local server logs for incoming POST /check
-4. Watch worker pod logs for "step-1 = success"
+Example:
+```
+38.154.203.95:5863:kpmtwkyv:t6ggqskw3rka
+198.105.121.200:6462:kpmtwkyv:t6ggqskw3rka
+64.137.96.74:6641:kpmtwkyv:t6ggqskw3rka
+```
+
+If `--workers` exceeds the number of proxies, proxies are reused round-robin.
 
 ---
 
-## Files Summary
+## How It Works
 
-| File | Change |
-|------|--------|
-| `ahref-lambda/ahrefs_checker.py` | Added FastAPI HTTP server with POST /check endpoint |
-| `domain-metrics-orchestration-service/app/service/ahref_domain_authority_checker_service.py` | Replaced AI Management polling with direct HTTP call |
-| `domain-metrics-orchestration-service/app/config/config.py` | Added `AHREF_LOCAL_SERVICE_URL` config field |
-| `domain-metrics-orchestration-service/.env.dev` | Added tunnel URL |
+1. Script launches N browser instances (each with its own proxy if enabled)
+2. Each worker independently polls `GET /ahref-authority/` for a domain
+3. When a domain is available, it opens a new tab, navigates to Ahrefs, extracts metrics
+4. Closes the work tab (browser stays alive on blank tab)
+5. Posts results to `POST /ahref-authority/` which routes to the next workflow step
+6. Loops back to step 2
+
+---
+
+## Services Involved
+
+| Service | Role |
+|---------|------|
+| **domain-metrics-management-service** | `GET /ahref-authority/` pops from queue, `POST /ahref-authority/` routes results to next step |
+| **domain-metrics-orchestration-service** | Worker scaled to 0 (not needed) |
+| **ahref-lambda (this script)** | Pulls domains, processes in browser, posts results |
+
+---
+
+## Stopping
+
+Press `Ctrl+C` to gracefully shut down all browser instances.
+
+---
+
+## Troubleshooting
+
+| Issue | Fix |
+|-------|-----|
+| Browser crashes with proxy | Check proxy credentials, ensure proxy supports HTTP |
+| Queue always empty | Create a campaign with ahref workflow in the frontend |
+| POST fails | Check if management service is deployed and accessible |
+| All workers idle | Normal when queue is empty — they poll every 3-5s |

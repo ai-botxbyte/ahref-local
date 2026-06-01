@@ -1,11 +1,10 @@
 """
-Ahrefs Website Authority Checker — Pull-based local script.
+Ahrefs Website Authority Checker — Pull-based, 5 parallel proxy instances.
 
-Polls GET /ahref-authority/ for domains, processes in browser, POSTs results back.
-Single browser instance reused across all domains.
+Each worker gets its own proxy and browser instance, all pulling from the same queue.
 
 Usage:
-    python ahrefs_checker.py [--api-url URL] [--headless] [--interval 5]
+    python ahrefs_checker.py [--api-url URL] [--headless] [--workers 5]
 """
 
 import argparse
@@ -16,13 +15,18 @@ import random
 import shutil
 import sys
 import tempfile
+import threading
 import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
 
 AHREFS_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ahrefs.json")
+PROXIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")
 DEFAULT_API_URL = "http://164.90.252.85/domain-metrics-management-service/api/v1"
 
 
@@ -35,13 +39,20 @@ def load_ahrefs_js() -> str:
     return action["script"]
 
 
+def load_proxies() -> List[str]:
+    if not os.path.exists(PROXIES_PATH):
+        return []
+    with open(PROXIES_PATH) as f:
+        return [line.strip() for line in f if line.strip()]
+
+
 def find_chrome_binary() -> Optional[str]:
     system = platform.system()
-    candidates: List[str] = []
+    candidates = []
     if system == "Linux":
-        candidates += ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium-browser"]
+        candidates = ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium-browser"]
     elif system == "Darwin":
-        candidates += ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+        candidates = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
     elif system == "Windows":
         for env in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
             base = os.environ.get(env, "")
@@ -65,7 +76,8 @@ def detect_chrome_major(chrome_binary: Optional[str]) -> Optional[int]:
         return None
 
 
-def build_driver(headless: bool, chrome_binary: Optional[str], version_main: Optional[int] = None):
+def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
+                 version_main: Optional[int], proxy: Optional[str] = None):
     import undetected_chromedriver as uc
 
     opts = uc.ChromeOptions()
@@ -76,10 +88,48 @@ def build_driver(headless: bool, chrome_binary: Optional[str], version_main: Opt
     opts.add_argument("--disable-infobars")
     opts.add_argument("--lang=en-US")
     opts.add_argument("--window-size=1280,900")
+
     if chrome_binary:
         opts.binary_location = chrome_binary
 
-    profile = os.path.join(tempfile.gettempdir(), "ahrefs_chrome_pull")
+    # Create proxy auth extension if proxy has credentials
+    if proxy:
+        parts = proxy.split(":")
+        if len(parts) == 4:
+            ip, port, user, passwd = parts
+            ext_dir = os.path.join(tempfile.gettempdir(), f"proxy_ext_w{worker_id}")
+            os.makedirs(ext_dir, exist_ok=True)
+            manifest = json.dumps({
+                "version": "1.0.0",
+                "manifest_version": 2,
+                "name": "Proxy Auth",
+                "permissions": ["proxy", "tabs", "unlimitedStorage", "storage",
+                                "<all_urls>", "webRequest", "webRequestBlocking"],
+                "background": {"scripts": ["background.js"]},
+                "minimum_chrome_version": "22.0.0"
+            })
+            background = f"""
+            var config = {{
+                mode: "fixed_servers",
+                rules: {{
+                    singleProxy: {{scheme: "http", host: "{ip}", port: parseInt({port})}},
+                    bypassList: ["localhost"]
+                }}
+            }};
+            chrome.proxy.settings.set({{value: config, scope: "regular"}}, function(){{}});
+            function callbackFn(details) {{
+                return {{authCredentials: {{username: "{user}", password: "{passwd}"}}}};
+            }}
+            chrome.webRequest.onAuthRequired.addListener(callbackFn,
+                {{urls: ["<all_urls>"]}}, ['blocking']);
+            """
+            ext_zip = os.path.join(tempfile.gettempdir(), f"proxy_ext_w{worker_id}.zip")
+            with zipfile.ZipFile(ext_zip, 'w') as zp:
+                zp.writestr("manifest.json", manifest)
+                zp.writestr("background.js", background)
+            opts.add_extension(ext_zip)
+
+    profile = os.path.join(tempfile.gettempdir(), f"ahrefs_chrome_w{worker_id}")
     shutil.rmtree(profile, ignore_errors=True)
     os.makedirs(profile, exist_ok=True)
 
@@ -192,12 +242,18 @@ def scrape_domain(driver, domain: str) -> Dict[str, Any]:
     return row
 
 
+# Thread-safe print
+_print_lock = threading.Lock()
+def tprint(msg):
+    with _print_lock:
+        print(msg)
+
+
 def pull_domain(api_url: str) -> Optional[Dict[str, Any]]:
-    """GET /ahref-authority/ to fetch a domain from the queue."""
     try:
         resp = requests.get(f"{api_url}/ahref-authority/", timeout=10)
         if resp.status_code == 204:
-            return None  # Queue empty
+            return None
         resp.raise_for_status()
         data = resp.json()
         if data.get("success"):
@@ -205,14 +261,12 @@ def pull_domain(api_url: str) -> Optional[Dict[str, Any]]:
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 204:
             return None
-        print(f"  [ERROR] GET failed: {e.response.status_code} {e.response.text[:100]}")
-    except Exception as e:
-        print(f"  [ERROR] GET failed: {e}")
+    except Exception:
+        pass
     return None
 
 
 def post_result(api_url: str, execution_record: Dict, result: Dict) -> bool:
-    """POST /ahref-authority/ to send results back."""
     try:
         resp = requests.post(
             f"{api_url}/ahref-authority/",
@@ -220,97 +274,117 @@ def post_result(api_url: str, execution_record: Dict, result: Dict) -> bool:
             timeout=30,
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("success", False)
-    except Exception as e:
-        print(f"  [ERROR] POST failed: {e}")
+        return resp.json().get("success", False)
+    except Exception:
         return False
 
 
-def main():
-    p = argparse.ArgumentParser(description="Ahrefs Checker - Pull Mode")
-    p.add_argument("--api-url", default=DEFAULT_API_URL, help="Management service API URL")
-    p.add_argument("--headless", action="store_true")
-    p.add_argument("--interval", type=int, default=5, help="Seconds to wait when queue is empty")
-    p.add_argument("--chrome", help="Path to chrome binary")
-    p.add_argument("--max-domains", type=int, default=0, help="Max domains to process (0=unlimited)")
-    args = p.parse_args()
-
-    chrome_bin = args.chrome or find_chrome_binary()
-    version_main = detect_chrome_major(chrome_bin)
-
-    print(f"[*] Ahrefs Checker - Pull Mode")
-    print(f"[*] API: {args.api_url}")
-    print(f"[*] Chrome: {chrome_bin}")
-    print(f"[*] Poll interval: {args.interval}s")
-    print(f"[*] Opening browser...\n")
+def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bool,
+                chrome_bin: Optional[str], version_main: Optional[int]):
+    """Single worker: opens browser with proxy, pulls and processes domains forever."""
+    proxy_short = proxy.split(":")[0] if proxy else "local"
+    tprint(f"  [W{worker_id}] Starting with proxy {proxy_short}...")
 
     driver = None
     processed = 0
 
-    try:
-        driver = build_driver(headless=args.headless, chrome_binary=chrome_bin, version_main=version_main)
-
-        # Open a blank tab as keep-alive, work will happen in a second tab
+    def start_browser():
+        nonlocal driver
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            time.sleep(1)
+        driver = build_driver(worker_id, headless=headless, chrome_binary=chrome_bin,
+                              version_main=version_main, proxy=proxy)
         driver.get("about:blank")
-        main_tab = driver.current_window_handle
+        tprint(f"  [W{worker_id}] Browser ready (proxy: {proxy_short})")
 
-        print("[*] Browser ready. Polling for domains...\n")
+    try:
+        start_browser()
 
         while True:
-            # Check max domains limit
-            if args.max_domains > 0 and processed >= args.max_domains:
-                print(f"\n[*] Reached max domains limit ({args.max_domains}). Stopping.")
-                break
-
-            # Pull a domain from the queue
-            record = pull_domain(args.api_url)
+            record = pull_domain(api_url)
 
             if record is None:
-                sys.stdout.write(f"\r[*] Queue empty. Waiting {args.interval}s...")
-                sys.stdout.flush()
-                time.sleep(args.interval)
+                time.sleep(3 + random.random() * 2)
                 continue
 
             domain = record.get("domain_name", "unknown")
-            execution_id = record.get("execution_id", "?")
-            print(f"\n[{processed + 1}] Got domain: {domain} (exec: {execution_id[:8]}...)")
+            execution_id = record.get("execution_id", "?")[:8]
+            tprint(f"  [W{worker_id}] Got: {domain} (exec: {execution_id})")
 
-            # Open new tab for this domain
-            driver.execute_cdp_cmd("Target.createTarget", {"url": "about:blank"})
-            time.sleep(0.5)
-            work_tab = [h for h in driver.window_handles if h != main_tab][-1]
-            driver.switch_to.window(work_tab)
+            try:
+                result = scrape_domain(driver, domain)
+                mark = "OK" if result["status"] == "completed" else "FAIL"
+                tprint(f"  [W{worker_id}] [{mark}] {domain} DR={result.get('dr', '-')} "
+                       f"BL={result.get('backlinks', '-')} ({result['elapsed_seconds']:.1f}s)")
+                # Navigate back to blank to reset state
+                driver.get("about:blank")
+            except Exception as e:
+                tprint(f"  [W{worker_id}] Error: {e.__class__.__name__}. Restarting browser...")
+                start_browser()
+                result = {"domain_name": domain, "status": "error", "error": str(e)}
 
-            # Process in browser
-            result = scrape_domain(driver, domain)
-            mark = "OK" if result["status"] == "completed" else "FAIL"
-            print(f"  [{mark}] DR={result.get('dr', '-')} BL={result.get('backlinks', '-')} "
-                  f"LW={result.get('linking_websites', '-')} ({result['elapsed_seconds']:.1f}s)")
-
-            # Close work tab, switch back to main blank tab
-            driver.close()
-            driver.switch_to.window(main_tab)
-
-            # Post result back
-            success = post_result(args.api_url, record, result)
-            if success:
-                print(f"  [POSTED] Result sent successfully")
-            else:
-                print(f"  [WARN] Failed to post result")
-
+            # Post result
+            post_result(api_url, record, result)
             processed += 1
 
     except KeyboardInterrupt:
-        print(f"\n\n[*] Interrupted. Processed {processed} domains.")
+        pass
+    except Exception as e:
+        tprint(f"  [W{worker_id}] FATAL: {e}")
     finally:
         if driver:
             try:
                 driver.quit()
             except Exception:
                 pass
+        tprint(f"  [W{worker_id}] Stopped. Processed: {processed}")
 
-    print(f"[*] Done. Total processed: {processed}")
+
+def main():
+    p = argparse.ArgumentParser(description="Ahrefs Checker - Parallel Pull Mode")
+    p.add_argument("--api-url", default=DEFAULT_API_URL)
+    p.add_argument("--headless", action="store_true")
+    p.add_argument("--workers", type=int, default=5, help="Number of parallel browser instances")
+    p.add_argument("--chrome", help="Path to chrome binary")
+    p.add_argument("--proxies", default=PROXIES_PATH, help="Path to proxies file")
+    p.add_argument("--no-proxy", action="store_true", help="Disable proxies, run all instances on local IP")
+    args = p.parse_args()
+
+    proxies = [] if args.no_proxy else load_proxies()
+    num_workers = args.workers
+
+    if not args.no_proxy and not proxies:
+        print("[WARN] No proxies found. Running all instances on local IP.")
+
+    chrome_bin = args.chrome or find_chrome_binary()
+    version_main = detect_chrome_major(chrome_bin)
+
+    print(f"[*] Ahrefs Checker - Parallel Pull Mode")
+    print(f"[*] API: {args.api_url}")
+    print(f"[*] Chrome: {chrome_bin}")
+    print(f"[*] Workers: {num_workers} | Proxy: {'disabled' if args.no_proxy or not proxies else f'{len(proxies)} loaded'}")
+    print(f"[*] Launching {num_workers} browser instances...\n")
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for i in range(num_workers):
+            proxy = proxies[i % len(proxies)] if proxies else None
+            f = executor.submit(
+                worker_loop, i, proxy, args.api_url, args.headless,
+                chrome_bin, version_main
+            )
+            futures.append(f)
+            time.sleep(5)  # Stagger launches to avoid resource contention
+
+        try:
+            for f in futures:
+                f.result()
+        except KeyboardInterrupt:
+            print("\n[*] Shutting down...")
 
 
 if __name__ == "__main__":
