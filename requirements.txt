@@ -1,2 +1,0 @@
-nodriver>=0.50.0
-setuptools>=68.0.0

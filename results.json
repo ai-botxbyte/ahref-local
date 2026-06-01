@@ -1,0 +1,24 @@
+[
+  {
+    "domain": "botxbyte.com",
+    "status": "completed",
+    "dr": "0.2",
+    "backlinks": "1.2K",
+    "linking_websites": "176",
+    "backlinks_dofollow_pct": "40",
+    "linking_websites_dofollow_pct": "21",
+    "elapsed_seconds": 15.11,
+    "finished_at": "2026-06-01T09:46:10.717872+00:00"
+  },
+  {
+    "domain": "github.com",
+    "status": "completed",
+    "dr": "97",
+    "backlinks": "3.7B",
+    "linking_websites": "2.3M",
+    "backlinks_dofollow_pct": "85",
+    "linking_websites_dofollow_pct": "94",
+    "elapsed_seconds": 17.89,
+    "finished_at": "2026-06-01T09:46:28.609442+00:00"
+  }
+]
