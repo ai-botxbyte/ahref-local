@@ -76,6 +76,16 @@ def detect_chrome_major(chrome_binary: Optional[str]) -> Optional[int]:
         return None
 
 
+def _free_port() -> int:
+    """Pick an unused TCP port to avoid chromedriver port races between concurrent instances."""
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
                  version_main: Optional[int], proxy: Optional[str] = None):
     import undetected_chromedriver as uc
@@ -88,6 +98,9 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
     opts.add_argument("--disable-infobars")
     opts.add_argument("--lang=en-US")
     opts.add_argument("--window-size=1280,900")
+    # Unique debugging port per instance — prevents collision when running
+    # alongside other UC scripts (e.g. bing-local) which also pick ports.
+    opts.add_argument(f"--remote-debugging-port={_free_port()}")
 
     if chrome_binary:
         opts.binary_location = chrome_binary
@@ -289,15 +302,36 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
     processed = 0
 
     def start_browser():
+        """Build the driver with up to 3 retries — chromedriver port races
+        can leave the first attempt with a dead session, especially when
+        another UC script (bing-local) is launching at the same time."""
         nonlocal driver
         if driver:
             try:
                 driver.quit()
             except Exception:
                 pass
-            time.sleep(1)
-        driver = build_driver(worker_id, headless=headless, chrome_binary=chrome_bin,
-                              version_main=version_main, proxy=proxy)
+            time.sleep(2)
+        last_err = None
+        for attempt in range(3):
+            try:
+                driver = build_driver(worker_id, headless=headless, chrome_binary=chrome_bin,
+                                      version_main=version_main, proxy=proxy)
+                # Sanity: a live session can run a trivial script
+                driver.execute_script("return 1")
+                break
+            except Exception as e:
+                last_err = e
+                tprint(f"  [W{worker_id}] driver build attempt {attempt+1} failed: {e}")
+                try:
+                    if driver:
+                        driver.quit()
+                except Exception:
+                    pass
+                driver = None
+                time.sleep(5 + attempt * 5)
+        if driver is None:
+            raise RuntimeError(f"driver build failed after 3 attempts: {last_err}")
         driver.get("about:blank")
         tprint(f"  [W{worker_id}] Browser ready (proxy: {proxy_short})")
 
@@ -378,7 +412,7 @@ def main():
                 chrome_bin, version_main
             )
             futures.append(f)
-            time.sleep(5)  # Stagger launches to avoid resource contention
+            time.sleep(10)  # Stagger launches to avoid resource contention / chromedriver port races
 
         try:
             for f in futures:
