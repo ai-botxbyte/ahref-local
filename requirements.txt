@@ -1,3 +1,6 @@
 undetected-chromedriver>=3.5.5
 selenium>=4.20.0
 requests>=2.31.0
+# Python 3.12+ removed distutils from stdlib; setuptools<81 still vendors it
+# (undetected-chromedriver imports distutils internally)
+setuptools<81
