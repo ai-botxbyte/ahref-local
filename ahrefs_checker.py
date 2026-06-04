@@ -27,7 +27,7 @@ import requests
 
 AHREFS_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ahrefs.json")
 PROXIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")
-DEFAULT_API_URL = "http://164.90.252.85/domain-metrics-management-service/api/v1"
+DEFAULT_API_URL = "https://b-domain.articleinnovator.com/domain-metrics-management-service/api/v1"
 
 
 def load_ahrefs_js() -> str:
