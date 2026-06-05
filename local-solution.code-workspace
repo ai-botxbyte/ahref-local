@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../bing-local"
+		},
+		{
+			"path": "../real-botxbyte-extension"
+		},
+		{
+			"path": "../firefox-serp-extension"
+		}
+	],
+	"settings": {}
+}

@@ -148,8 +148,8 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
 
     driver = uc.Chrome(options=opts, headless=headless, use_subprocess=True,
                        version_main=version_main, user_data_dir=profile)
-    driver.set_page_load_timeout(30)
-    driver.set_script_timeout(120)
+    driver.set_page_load_timeout(15)
+    driver.set_script_timeout(45)
     return driver
 
 
