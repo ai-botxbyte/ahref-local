@@ -24,10 +24,87 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+
+try:
+    from urllib3.util.retry import Retry
+except ImportError:  # pragma: no cover
+    from requests.packages.urllib3.util.retry import Retry  # type: ignore
 
 AHREFS_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ahrefs.json")
 PROXIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")
 DEFAULT_API_URL = "https://b-domain.articleinnovator.com/domain-metrics-management-service/api/v1"
+
+
+# ----------------------------------------------------------------------------
+# HTTP resilience — retries on DNS / 5xx
+# ----------------------------------------------------------------------------
+
+def _make_resilient_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=5, connect=5, read=5, status=5,
+        backoff_factor=1.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST", "PUT", "PATCH", "DELETE"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+_HTTP = _make_resilient_session()
+
+
+# ----------------------------------------------------------------------------
+# Driver-build serialization — undetected_chromedriver patches its own
+# binary at runtime; concurrent uc.Chrome() calls cause the binary to vanish
+# (FileNotFoundError on /home/.../undetected_chromedriver). We serialize the
+# patching with a file lock and pre-cache the binary on first use.
+# ----------------------------------------------------------------------------
+
+_DRIVER_BUILD_LOCK_PATH = "/tmp/uc_driver_build.lock"
+_driver_build_lock = threading.Lock()  # within-process
+
+UC_CACHE_DIR = os.path.expanduser("~/.local/share/undetected_chromedriver")
+
+
+def _acquire_driver_build_lock(timeout: float = 60.0) -> Optional[Any]:
+    """Cross-process lock around uc.Chrome() construction.
+
+    Returns the file handle (caller must release) or None on timeout.
+    Falls back gracefully if `fcntl` isn't available (Windows).
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return None  # OS doesn't support flock — best effort
+    deadline = time.time() + timeout
+    fh = open(_DRIVER_BUILD_LOCK_PATH, "w")
+    while time.time() < deadline:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except BlockingIOError:
+            time.sleep(0.5)
+    fh.close()
+    return None
+
+
+def _release_driver_build_lock(fh: Optional[Any]) -> None:
+    if fh is None:
+        return
+    try:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
 
 
 def load_ahrefs_js() -> str:
@@ -88,8 +165,29 @@ def _free_port() -> int:
 
 def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
                  version_main: Optional[int], proxy: Optional[str] = None):
+    """Build a uc.Chrome driver. Serialized cross-process via flock so
+    undetected_chromedriver's binary patching doesn't race between workers."""
     import undetected_chromedriver as uc
 
+    # 1. Cross-process lock — undetected_chromedriver writes to a shared
+    #    binary in ~/.local/share/undetected_chromedriver. Two workers
+    #    patching at the same time can leave one with FileNotFoundError.
+    file_lock = _acquire_driver_build_lock(timeout=120.0)
+
+    # 2. In-process lock as a second layer (cheap)
+    with _driver_build_lock:
+        try:
+            return _build_driver_locked(
+                worker_id, headless=headless, chrome_binary=chrome_binary,
+                version_main=version_main, proxy=proxy, uc=uc,
+            )
+        finally:
+            _release_driver_build_lock(file_lock)
+
+
+def _build_driver_locked(worker_id: int, headless: bool, chrome_binary: Optional[str],
+                         version_main: Optional[int], proxy: Optional[str],
+                         uc):
     opts = uc.ChromeOptions()
     opts.page_load_strategy = "eager"
     opts.add_argument("--no-first-run")
@@ -146,11 +244,64 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
     shutil.rmtree(profile, ignore_errors=True)
     os.makedirs(profile, exist_ok=True)
 
+    # Repair the undetected_chromedriver binary cache if it disappeared.
+    # uc.Chrome() will re-download the canonical chromedriver and patch it
+    # if missing — but if we have a known-good backup, restore that to
+    # avoid the network round-trip and the brief race window where the
+    # binary doesn't exist on disk.
+    _ensure_uc_binary_present()
+
     driver = uc.Chrome(options=opts, headless=headless, use_subprocess=True,
                        version_main=version_main, user_data_dir=profile)
     driver.set_page_load_timeout(15)
     driver.set_script_timeout(45)
+
+    # Snapshot the patched binary so we can restore it next time.
+    _snapshot_uc_binary()
     return driver
+
+
+# ----------------------------------------------------------------------------
+# undetected_chromedriver binary cache management
+# ----------------------------------------------------------------------------
+
+_UC_BIN_BACKUP = "/tmp/uc_chromedriver.backup"
+
+
+def _ensure_uc_binary_present() -> None:
+    """If our backup exists but the canonical UC binary is missing, restore it."""
+    try:
+        os.makedirs(UC_CACHE_DIR, exist_ok=True)
+    except Exception:
+        return
+    canonical = os.path.join(UC_CACHE_DIR, "undetected_chromedriver")
+    if os.path.exists(canonical):
+        return
+    if os.path.exists(_UC_BIN_BACKUP):
+        try:
+            shutil.copy2(_UC_BIN_BACKUP, canonical)
+            os.chmod(canonical, 0o755)
+            print(f"  [uc-cache] restored chromedriver from backup", flush=True)
+        except Exception as e:  # pragma: no cover
+            print(f"  [uc-cache] restore failed: {e}", flush=True)
+
+
+def _snapshot_uc_binary() -> None:
+    """Snapshot the patched UC binary to /tmp so we can restore on next run."""
+    canonical = os.path.join(UC_CACHE_DIR, "undetected_chromedriver")
+    if not os.path.exists(canonical):
+        return
+    try:
+        # Only copy if the source has changed (avoid wasted I/O)
+        if os.path.exists(_UC_BIN_BACKUP):
+            try:
+                if os.path.getsize(canonical) == os.path.getsize(_UC_BIN_BACKUP):
+                    return
+            except Exception:
+                pass
+        shutil.copy2(canonical, _UC_BIN_BACKUP)
+    except Exception:
+        pass
 
 
 def scrape_domain(driver, domain: str) -> Dict[str, Any]:
@@ -263,8 +414,9 @@ def tprint(msg):
 
 
 def pull_domain(api_url: str) -> Optional[Dict[str, Any]]:
+    """Pull a single domain from the queue. Uses resilient session for retries."""
     try:
-        resp = requests.get(f"{api_url}/ahref-authority/", timeout=10)
+        resp = _HTTP.get(f"{api_url}/ahref-authority/", timeout=(10, 30))
         if resp.status_code == 204:
             return None
         resp.raise_for_status()
@@ -272,22 +424,122 @@ def pull_domain(api_url: str) -> Optional[Dict[str, Any]]:
         if data.get("success"):
             return data["data"]
     except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 204:
+        if e.response is not None and e.response.status_code == 204:
             return None
-    except Exception:
-        pass
+    except Exception as e:
+        # After 5 retries this still failed — log so the watchdog catches it.
+        tprint(f"  [pull] error after retries: {e}")
     return None
 
 
 def post_result(api_url: str, execution_record: Dict, result: Dict) -> bool:
+    """Post a single result. Failed results are buffered to disk."""
     try:
-        resp = requests.post(
+        resp = _HTTP.post(
             f"{api_url}/ahref-authority/",
             json={"execution_record": execution_record, "result": result},
-            timeout=30,
+            timeout=(10, 60),
         )
         resp.raise_for_status()
-        return resp.json().get("success", False)
+        ok = resp.json().get("success", False)
+        if not ok:
+            _buffer_ahref_failed_post(execution_record, result)
+        return ok
+    except Exception as e:
+        tprint(f"  [post] error after retries: {e}; buffering result for {result.get('domain_name')}")
+        _buffer_ahref_failed_post(execution_record, result)
+        return False
+
+
+# ----------------------------------------------------------------------------
+# Persistent post buffer — never lose a result
+# ----------------------------------------------------------------------------
+
+AHREF_POST_BUFFER = os.environ.get(
+    "AHREF_POST_BUFFER", "/tmp/ahref-local_pending_posts.jsonl"
+)
+_ahref_buffer_lock = threading.Lock()
+
+
+def _buffer_ahref_failed_post(execution_record: Dict, result: Dict) -> None:
+    try:
+        with _ahref_buffer_lock:
+            with open(AHREF_POST_BUFFER, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "execution_record": execution_record,
+                    "result": result,
+                }) + "\n")
+    except Exception as e:  # pragma: no cover
+        print(f"  [buffer] FATAL: cannot write ahref post buffer: {e}", flush=True)
+
+
+def _flush_pending_ahref_posts(api_url: str, max_per_run: int = 50) -> int:
+    if not os.path.exists(AHREF_POST_BUFFER):
+        return 0
+    flushed = 0
+    remaining: List[str] = []
+    with _ahref_buffer_lock:
+        try:
+            with open(AHREF_POST_BUFFER, "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except Exception:
+            return 0
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if flushed >= max_per_run:
+                remaining.append(line)
+                continue
+            try:
+                obj = json.loads(line)
+                resp = _HTTP.post(
+                    f"{api_url}/ahref-authority/",
+                    json={"execution_record": obj["execution_record"],
+                          "result": obj["result"]},
+                    timeout=(10, 60),
+                )
+                if resp.status_code < 400 and resp.json().get("success"):
+                    flushed += 1
+                    continue
+            except Exception:
+                pass
+            remaining.append(line)
+        try:
+            with open(AHREF_POST_BUFFER, "w", encoding="utf-8") as fh:
+                for ln in remaining:
+                    fh.write(ln + "\n")
+        except Exception:  # pragma: no cover
+            pass
+    return flushed
+
+
+def _start_ahref_buffer_flusher(api_url: str) -> threading.Thread:
+    def loop():
+        while True:
+            time.sleep(30)
+            try:
+                n = _flush_pending_ahref_posts(api_url)
+                if n:
+                    tprint(f"  [flusher] re-sent {n} buffered ahref posts")
+            except Exception as e:
+                tprint(f"  [flusher] error: {e}")
+    t = threading.Thread(target=loop, daemon=True, name="ahref-post-flusher")
+    t.start()
+    return t
+
+
+# ----------------------------------------------------------------------------
+# Browser healthcheck — detect dead drivers proactively
+# ----------------------------------------------------------------------------
+
+def _is_driver_alive(driver) -> bool:
+    """Return True if `driver` can execute a trivial script."""
+    if driver is None:
+        return False
+    try:
+        return driver.execute_script("return 1") == 1
     except Exception:
         return False
 
@@ -302,9 +554,10 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
     processed = 0
 
     def start_browser():
-        """Build the driver with up to 3 retries — chromedriver port races
-        can leave the first attempt with a dead session, especially when
-        another UC script (bing-local) is launching at the same time."""
+        """Build the driver with up to 10 retries with exponential backoff.
+        Chromedriver port races and undetected_chromedriver binary corruption
+        can cause early attempts to fail; the file lock + binary cache make
+        later attempts succeed."""
         nonlocal driver
         if driver:
             try:
@@ -313,32 +566,49 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
                 pass
             time.sleep(2)
         last_err = None
-        for attempt in range(3):
+        for attempt in range(10):
             try:
                 driver = build_driver(worker_id, headless=headless, chrome_binary=chrome_bin,
                                       version_main=version_main, proxy=proxy)
                 # Sanity: a live session can run a trivial script
-                driver.execute_script("return 1")
-                break
+                if _is_driver_alive(driver):
+                    break
+                raise RuntimeError("driver built but is_alive() returned False")
             except Exception as e:
                 last_err = e
-                tprint(f"  [W{worker_id}] driver build attempt {attempt+1} failed: {e}")
+                tprint(f"  [W{worker_id}] driver build attempt {attempt+1}/10 failed: {e}")
                 try:
                     if driver:
                         driver.quit()
                 except Exception:
                     pass
                 driver = None
-                time.sleep(5 + attempt * 5)
+                # Exponential backoff: 5, 10, 20, 40, 60, 60, 60, 60, 60, 60
+                sleep_s = min(5 * (2 ** attempt), 60)
+                time.sleep(sleep_s)
         if driver is None:
-            raise RuntimeError(f"driver build failed after 3 attempts: {last_err}")
-        driver.get("about:blank")
+            raise RuntimeError(f"driver build failed after 10 attempts: {last_err}")
+        try:
+            driver.get("about:blank")
+        except Exception:
+            pass
         tprint(f"  [W{worker_id}] Browser ready (proxy: {proxy_short})")
 
     try:
         start_browser()
+        last_healthcheck = time.time()
 
         while True:
+            # Periodic healthcheck: every 60s, probe the driver. If it's
+            # silently dead (rare but possible after Chrome OOM), rebuild
+            # before the next batch instead of after a failed scrape.
+            now = time.time()
+            if now - last_healthcheck > 60:
+                if not _is_driver_alive(driver):
+                    tprint(f"  [W{worker_id}] healthcheck failed — rebuilding browser")
+                    start_browser()
+                last_healthcheck = now
+
             record = pull_domain(api_url)
 
             if record is None:
@@ -355,15 +625,34 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
                 tprint(f"  [W{worker_id}] [{mark}] {domain} DR={result.get('dr', '-')} "
                        f"BL={result.get('backlinks', '-')} ({result['elapsed_seconds']:.1f}s)")
                 # Navigate back to blank to reset state
-                driver.get("about:blank")
+                try:
+                    driver.get("about:blank")
+                except Exception:
+                    # If even about:blank fails, browser is dead — rebuild.
+                    tprint(f"  [W{worker_id}] post-scrape navigation failed; rebuilding browser")
+                    start_browser()
             except Exception as e:
-                tprint(f"  [W{worker_id}] Error: {e.__class__.__name__}. Restarting browser...")
-                start_browser()
+                tprint(f"  [W{worker_id}] Error: {e.__class__.__name__}: {e}. Restarting browser...")
+                try:
+                    start_browser()
+                except Exception as e2:
+                    # Re-raise to let the watchdog restart the whole process
+                    tprint(f"  [W{worker_id}] FATAL: cannot rebuild browser: {e2}")
+                    raise
                 result = {"domain_name": domain, "status": "error", "error": str(e)}
 
-            # Post result
+            # Post result — buffered to disk on failure so we never lose it
             post_result(api_url, record, result)
             processed += 1
+
+            # Proactive recycle: undetected_chromedriver leaks file handles
+            # over time. Recycle every 50 domains to stay healthy.
+            if processed > 0 and processed % 50 == 0:
+                tprint(f"  [W{worker_id}] processed {processed} — recycling browser")
+                try:
+                    start_browser()
+                except Exception as e:
+                    tprint(f"  [W{worker_id}] recycle failed (continuing): {e}")
 
     except KeyboardInterrupt:
         pass
@@ -402,6 +691,13 @@ def main():
     print(f"[*] Chrome: {chrome_bin}")
     print(f"[*] Workers: {num_workers} | Proxy: {'disabled' if args.no_proxy or not proxies else f'{len(proxies)} loaded'}")
     print(f"[*] Launching {num_workers} browser instances...\n")
+
+    # Flush any results buffered from a previous crashed run, then start the
+    # background flusher to handle ongoing buffer drains.
+    initial = _flush_pending_ahref_posts(args.api_url, max_per_run=200)
+    if initial:
+        print(f"[*] Recovered {initial} buffered posts from previous run")
+    _start_ahref_buffer_flusher(args.api_url)
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = []
