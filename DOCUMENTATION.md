@@ -6,6 +6,22 @@ Local script that pulls domains from the server queue, processes them in paralle
 
 ---
 
+## Local vendored setup (recommended)
+
+Run once after cloning the repo:
+
+```bash
+bash tools/setup_vendor.sh
+```
+
+This downloads ungoogled-chromium (portable build, ~135 MB) into `vendor/ungoogled-chromium/` and clones the [cf-autoclick](https://github.com/tenacious6/cf-autoclick) extension into `vendor/cf-autoclick/`. Both are gitignored — they live in your local clone only.
+
+After that, `ahrefs_checker.py` auto-discovers both at runtime, so you don't need any `--chrome` or `--extension` flags. It also skips the GitHub master-profile download entirely.
+
+To upgrade chromium later: bump `CHROMIUM_VERSION` in `tools/setup_vendor.sh`, delete `vendor/ungoogled-chromium/`, and re-run the script.
+
+---
+
 ## Architecture (Pull Approach)
 
 ```

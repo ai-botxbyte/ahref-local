@@ -438,7 +438,12 @@ def find_chrome_binary() -> Optional[str]:
     system = platform.system()
     candidates = []
     if system == "Linux":
+        # Prefer the vendored ungoogled-chromium build shipped in vendor/
+        # so the script Just Works after the one-time tools/setup_vendor.sh
+        # extraction. Falls back to system installs if vendor/ is missing.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
         candidates = [
+            os.path.join(script_dir, "vendor", "ungoogled-chromium", "chrome"),
             "/usr/bin/ungoogled-chromium",
             "/usr/bin/chromium-browser",
             "/usr/bin/chromium",
@@ -517,6 +522,12 @@ def _build_driver_locked(worker_id: int, headless: bool, chrome_binary: Optional
     opts.add_argument("--lang=en-US")
     opts.add_argument("--window-size=1280,900")
     opts.add_argument(f"--remote-debugging-port={_free_port()}")
+    # Skip GNOME/KDE keyring + macOS Keychain prompts on Linux desktops —
+    # otherwise Chromium blocks startup waiting for the user to unlock the
+    # secret store. We don't store passwords in the worker profile, so the
+    # plaintext "basic" backend is fine.
+    opts.add_argument("--password-store=basic")
+    opts.add_argument("--use-mock-keychain")
 
     # ── Extension + Profile loading ───────────────────────────────────────
     if extension_path and os.path.isdir(extension_path):
@@ -1056,12 +1067,23 @@ def main():
         print(f"[*] Extension: {extension_path} (direct --load-extension, skipping GitHub profile)",
               flush=True)
     else:
-        # Only download master profile when --extension is NOT passed
-        try:
-            _download_master_profile()
-        except Exception as e:
-            print(f"[FATAL] Cannot bootstrap master profile: {e}", file=sys.stderr)
-            sys.exit(2)
+        # Auto-discover the vendored cf-autoclick clone before falling back to
+        # the GitHub master-profile download. This is what tools/setup_vendor.sh
+        # populates — running ahrefs_checker.py with no flags should Just Work.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        vendored_ext = os.path.join(script_dir, "vendor", "cf-autoclick")
+        if os.path.isfile(os.path.join(vendored_ext, "manifest.json")):
+            extension_path = vendored_ext
+            print(f"[*] Extension: {extension_path} (auto-discovered from vendor/, "
+                  f"skipping GitHub profile)", flush=True)
+        else:
+            # Only download master profile when --extension is NOT passed AND
+            # vendor/cf-autoclick is missing.
+            try:
+                _download_master_profile()
+            except Exception as e:
+                print(f"[FATAL] Cannot bootstrap master profile: {e}", file=sys.stderr)
+                sys.exit(2)
 
     proxies = [] if args.no_proxy else load_proxies()
     num_workers = args.workers

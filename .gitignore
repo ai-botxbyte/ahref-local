@@ -29,3 +29,9 @@ serverless.yml
 # uploaded to GitHub release by tools/upload_profile_release.sh — never commit)
 master-profile/
 master-profile.zip
+
+# Vendored browser binary + extension (populated by tools/setup_vendor.sh,
+# one-time setup — never commit, too large / has its own .git)
+vendor/ungoogled-chromium/
+vendor/ungoogled-chromium.tar.xz
+vendor/cf-autoclick/
