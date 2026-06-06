@@ -35,6 +35,9 @@ AHREFS_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ahr
 PROXIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")
 DEFAULT_API_URL = "https://b-domain.articleinnovator.com/domain-metrics-management-service/api/v1"
 
+# Cloudflare auto-click extension path (solves Cloudflare Turnstile captchas)
+CF_AUTOCLICK_EXTENSION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cf-autoclick-master")
+
 
 # ----------------------------------------------------------------------------
 # HTTP resilience — retries on DNS / 5xx
@@ -196,59 +199,54 @@ def _build_driver_locked(worker_id: int, headless: bool, chrome_binary: Optional
     opts.add_argument("--disable-infobars")
     opts.add_argument("--lang=en-US")
     opts.add_argument("--window-size=1280,900")
-    # Unique debugging port per instance — prevents collision when running
-    # alongside other UC scripts (e.g. bing-local) which also pick ports.
     opts.add_argument(f"--remote-debugging-port={_free_port()}")
+
+    # Persistent profile for this worker (extension stays loaded after first install)
+    profile = os.path.join(tempfile.gettempdir(), f"ahrefs_chrome_w{worker_id}")
+    os.makedirs(profile, exist_ok=True)
+
+    # Copy cf-autoclick extension to profile only if not already present
+    cf_ext_path = os.path.abspath(CF_AUTOCLICK_EXTENSION_PATH)
+    ext_dest = os.path.join(profile, "Extensions", "cf_autoclick")
+    if os.path.isdir(cf_ext_path) and not os.path.isdir(ext_dest):
+        os.makedirs(os.path.dirname(ext_dest), exist_ok=True)
+        shutil.copytree(cf_ext_path, ext_dest)
+        print(f"  [worker-{worker_id}] Installed cf-autoclick extension", flush=True)
+
+    # Load extension from profile
+    if os.path.isdir(ext_dest):
+        opts.add_argument(f"--load-extension={ext_dest}")
 
     if chrome_binary:
         opts.binary_location = chrome_binary
 
-    # Create proxy auth extension if proxy has credentials
+    # Proxy auth extension if needed
     if proxy:
         parts = proxy.split(":")
         if len(parts) == 4:
             ip, port, user, passwd = parts
-            ext_dir = os.path.join(tempfile.gettempdir(), f"proxy_ext_w{worker_id}")
-            os.makedirs(ext_dir, exist_ok=True)
-            manifest = json.dumps({
-                "version": "1.0.0",
-                "manifest_version": 2,
-                "name": "Proxy Auth",
-                "permissions": ["proxy", "tabs", "unlimitedStorage", "storage",
-                                "<all_urls>", "webRequest", "webRequestBlocking"],
-                "background": {"scripts": ["background.js"]},
-                "minimum_chrome_version": "22.0.0"
-            })
-            background = f"""
-            var config = {{
-                mode: "fixed_servers",
-                rules: {{
-                    singleProxy: {{scheme: "http", host: "{ip}", port: parseInt({port})}},
-                    bypassList: ["localhost"]
-                }}
-            }};
-            chrome.proxy.settings.set({{value: config, scope: "regular"}}, function(){{}});
-            function callbackFn(details) {{
-                return {{authCredentials: {{username: "{user}", password: "{passwd}"}}}};
-            }}
-            chrome.webRequest.onAuthRequired.addListener(callbackFn,
-                {{urls: ["<all_urls>"]}}, ['blocking']);
-            """
             ext_zip = os.path.join(tempfile.gettempdir(), f"proxy_ext_w{worker_id}.zip")
             with zipfile.ZipFile(ext_zip, 'w') as zp:
-                zp.writestr("manifest.json", manifest)
-                zp.writestr("background.js", background)
+                zp.writestr("manifest.json", json.dumps({
+                    "version": "1.0.0", "manifest_version": 2, "name": "Proxy Auth",
+                    "permissions": ["proxy", "tabs", "unlimitedStorage", "storage",
+                                    "<all_urls>", "webRequest", "webRequestBlocking"],
+                    "background": {"scripts": ["background.js"]},
+                    "minimum_chrome_version": "22.0.0"
+                }))
+                zp.writestr("background.js", f"""
+                    var config = {{mode: "fixed_servers", rules: {{
+                        singleProxy: {{scheme: "http", host: "{ip}", port: parseInt({port})}},
+                        bypassList: ["localhost"]
+                    }}}};
+                    chrome.proxy.settings.set({{value: config, scope: "regular"}}, function(){{}});
+                    chrome.webRequest.onAuthRequired.addListener(
+                        function(details) {{ return {{authCredentials: {{username: "{user}", password: "{passwd}"}}}}; }},
+                        {{urls: ["<all_urls>"]}}, ['blocking']
+                    );
+                """)
             opts.add_extension(ext_zip)
 
-    profile = os.path.join(tempfile.gettempdir(), f"ahrefs_chrome_w{worker_id}")
-    shutil.rmtree(profile, ignore_errors=True)
-    os.makedirs(profile, exist_ok=True)
-
-    # Repair the undetected_chromedriver binary cache if it disappeared.
-    # uc.Chrome() will re-download the canonical chromedriver and patch it
-    # if missing — but if we have a known-good backup, restore that to
-    # avoid the network round-trip and the brief race window where the
-    # binary doesn't exist on disk.
     _ensure_uc_binary_present()
 
     driver = uc.Chrome(options=opts, headless=headless, use_subprocess=True,
@@ -256,7 +254,6 @@ def _build_driver_locked(worker_id: int, headless: bool, chrome_binary: Optional
     driver.set_page_load_timeout(15)
     driver.set_script_timeout(45)
 
-    # Snapshot the patched binary so we can restore it next time.
     _snapshot_uc_binary()
     return driver
 
