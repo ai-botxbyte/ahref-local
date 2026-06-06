@@ -11,16 +11,10 @@ env:
   AHREF_DIR: "/home/runner/ahref-local"
   # The script auto-routes between both queues — workflow doesn't pick.
   AHREF_MODES: "authority,traffic"
-  # Master profile asset hosted on the test-abc GitHub release. ahrefs_checker.py
-  # would download this itself on every run, but pre-downloading here gives
-  # cleaner workflow logs and lets the watchdog restart the script instantly
-  # (no re-download per restart).
-  PROFILE_RELEASE_URL: "https://github.com/sanket-sakariya/test-abc/releases/download/worker-profile-v1/ahrefs-worker-profile.zip"
-  AHREF_MASTER_PROFILE_DIR: "/tmp/ahref_master_profile"
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: 16core
     timeout-minutes: 360
 
     steps:
@@ -181,63 +175,23 @@ jobs:
           echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
           echo "✅ Cloudflare tunnel ready: $TUNNEL_URL"
 
-      - name: Download Master Profile (with cf-autoclick extension)
+      - name: Setup vendored chromium + cf-autoclick extension
         timeout-minutes: 5
         run: |
-          echo "[*] Downloading master profile from ${PROFILE_RELEASE_URL}"
-          ZIP=/tmp/ahrefs-worker-profile.zip
-          rm -rf "${AHREF_MASTER_PROFILE_DIR}" "${ZIP}"
-          mkdir -p "${AHREF_MASTER_PROFILE_DIR}"
+          # vendor/ is gitignored, so a fresh clone has neither the chromium
+          # binary nor the extension. tools/setup_vendor.sh downloads
+          # ungoogled-chromium and clones cf-autoclick into vendor/ — after
+          # this, ahrefs_checker.py auto-discovers both.
+          echo "[*] Populating $AHREF_DIR/vendor/ ..."
+          cd "$AHREF_DIR"
+          bash tools/setup_vendor.sh
 
-          # GitHub release assets always 302 → blob storage; -L follows it.
-          # --retry 5 handles flaky CI runners; --fail bails on HTTP 4xx/5xx.
-          curl -sSL --fail --retry 5 --retry-delay 3 \
-            --connect-timeout 15 --max-time 240 \
-            -o "${ZIP}" "${PROFILE_RELEASE_URL}"
-
-          SIZE=$(du -h "${ZIP}" | cut -f1)
-          echo "✅ Downloaded ${SIZE}"
-
-          # Extract into a wrapper dir, then move the inner profile up so the
-          # path layout is exactly what the local script expects:
-          #   ${AHREF_MASTER_PROFILE_DIR}/Extensions/cf_autoclick/manifest.json
-          STAGE=/tmp/ahref_master_stage
-          rm -rf "${STAGE}" && mkdir -p "${STAGE}"
-          unzip -q "${ZIP}" -d "${STAGE}"
-
-          # Find the profile root — the dir containing Extensions/cf_autoclick.
-          # The zip wraps everything in a single top-level dir (ahrefs-worker-profile/),
-          # but be tolerant of either layout in case the release changes.
-          FOUND=""
-          for cand in "${STAGE}" "${STAGE}"/*/ ; do
-            if [ -f "${cand}/Extensions/cf_autoclick/manifest.json" ]; then
-              FOUND="${cand%/}"
-              break
-            fi
-          done
-
-          if [ -z "${FOUND}" ]; then
-            echo "❌ Downloaded zip is malformed — no Extensions/cf_autoclick/manifest.json found"
-            echo "    Contents:"
-            ls -la "${STAGE}" || true
-            exit 1
-          fi
-
-          # Move the contents of FOUND into AHREF_MASTER_PROFILE_DIR.
-          # We use rsync (already installed on ubuntu-latest) so we don't
-          # care whether FOUND == STAGE or a subdirectory.
-          rsync -a "${FOUND}/" "${AHREF_MASTER_PROFILE_DIR}/"
-
-          # Final sanity check
-          if [ ! -f "${AHREF_MASTER_PROFILE_DIR}/Extensions/cf_autoclick/manifest.json" ]; then
-            echo "❌ Extension missing after extraction: ${AHREF_MASTER_PROFILE_DIR}/Extensions/cf_autoclick/manifest.json"
-            exit 1
-          fi
-          echo "✅ Master profile ready at ${AHREF_MASTER_PROFILE_DIR}"
-          echo "    Profile size: $(du -sh ${AHREF_MASTER_PROFILE_DIR} | cut -f1)"
-
-          # Clean up the intermediate files now — keep just the profile dir.
-          rm -rf "${ZIP}" "${STAGE}"
+          # Sanity check: both must exist before the checker starts.
+          test -x vendor/ungoogled-chromium/chrome \
+            || { echo "❌ vendor/ungoogled-chromium/chrome missing"; exit 1; }
+          test -f vendor/cf-autoclick/manifest.json \
+            || { echo "❌ vendor/cf-autoclick/manifest.json missing"; exit 1; }
+          echo "✅ Vendor setup complete"
 
       - name: Start Ahref Checker
         run: |
@@ -297,14 +251,15 @@ jobs:
             fi
 
             # Restart checker if it died — same modes the workflow was configured with.
-            # AHREF_MASTER_PROFILE_DIR is exported via the workflow `env`, so the
-            # restarted process reuses the already-downloaded master profile and
-            # skips re-downloading it from GitHub.
+            # vendor/ is already populated from the setup step, so the restarted
+            # process auto-discovers chromium + extension instantly without any
+            # downloads.
             if ! pgrep -f "ahrefs_checker.py" > /dev/null; then
-              echo "⚠️ Ahref checker stopped! Restarting (modes: ${AHREF_MODES}, profile: ${AHREF_MASTER_PROFILE_DIR})..."
+              echo "⚠️ Ahref checker stopped! Restarting (modes: ${AHREF_MODES})..."
               export DISPLAY=:1
               export NO_AT_BRIDGE=1
               cd "$AHREF_DIR"
+              source .venv/bin/activate
               nohup python3 ahrefs_checker.py --workers 1 --no-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
               sleep 3
             fi
