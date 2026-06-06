@@ -306,6 +306,22 @@ def _create_worker_profile(worker_id: int) -> str:
     workers (or two restarts of the same worker_id within one run) never
     fight over the same /tmp dir. Tracked in _CREATED_PROFILES so the
     global cleanup hook can remove every one on process exit.
+
+    After copying we ALSO strip Chrome's MAC-protected pref files. Chrome
+    keeps an HMAC over Local State and Secure Preferences keyed to the OS
+    user-id of the machine that wrote them; when a profile is copied
+    across machines (laptop → server → /tmp/ahref_w0_xxx) the MAC stops
+    validating and Chrome silently:
+      - resets "sensitive" prefs back to defaults
+      - turns off extensions whose entries fell outside the validated MAC
+        scope (cf-autoclick is one — its `debugger` permission marks it
+        sensitive)
+      - logs "Reset due to invalid mac" internally
+
+    By deleting these files we force Chrome to regenerate them fresh
+    against the current machine identity — our --load-extension /
+    --disable-extensions-except flags then load cleanly because there's
+    no stale invalid MAC fighting them.
     """
     master = _download_master_profile()
     profile_id = f"ahref_w{worker_id}_{uuid.uuid4().hex[:8]}"
@@ -323,6 +339,23 @@ def _create_worker_profile(worker_id: int) -> str:
             f"[W{worker_id}] Per-worker profile missing cf-autoclick after copy: "
             f"{ext_manifest}"
         )
+
+    # Strip MAC-protected files — Chrome regenerates them on first launch.
+    # See docstring for rationale. We only nuke the files that hold MACs;
+    # the rest of the profile (cookies, extension files, history) survives.
+    mac_files = [
+        os.path.join(dest, "Local State"),
+        os.path.join(dest, "Default", "Secure Preferences"),
+        # Preferences is NOT MAC-protected by itself but Chrome 120+ refuses
+        # to read it when Local State's MAC is missing — easier to wipe both.
+        os.path.join(dest, "Default", "Preferences"),
+    ]
+    for f in mac_files:
+        try:
+            if os.path.isfile(f):
+                os.remove(f)
+        except OSError:
+            pass
 
     with _PROFILES_LOCK:
         _CREATED_PROFILES.append(dest)
@@ -547,7 +580,29 @@ def _build_driver_locked(worker_id: int, headless: bool, chrome_binary: Optional
 
     ext_dest = os.path.join(profile, "Extensions", "cf_autoclick")
     if os.path.isdir(ext_dest):
+        # Chrome 117+ silently ignores --load-extension unless one of these
+        # is also true:
+        #   (a) Developer Mode is enabled in Preferences, OR
+        #   (b) --disable-extensions-except is also passed with the same path
+        #
+        # We can't rely on (a) — the master profile is built on a different
+        # machine and Chrome resets sensitive prefs (including dev mode) when
+        # the profile is copied across users due to the HMAC on Local State
+        # and Secure Preferences not validating.
+        #
+        # (b) bypasses dev-mode entirely AND survives the auto-disable check
+        # that Chrome runs on extensions holding privileged permissions like
+        # `debugger` (which cf-autoclick uses). Both flags must point at the
+        # same absolute path.
         opts.add_argument(f"--load-extension={ext_dest}")
+        opts.add_argument(f"--disable-extensions-except={ext_dest}")
+        print(f"  [worker-{worker_id}] Loading extension: {ext_dest}", flush=True)
+    else:
+        # Defensive — _create_worker_profile already verifies the manifest
+        # exists and raises if not, so reaching here means something deleted
+        # the dir between copy and driver build.
+        print(f"  [worker-{worker_id}] WARNING: extension dir missing at {ext_dest}",
+              flush=True)
 
     if chrome_binary:
         opts.binary_location = chrome_binary

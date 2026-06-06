@@ -245,6 +245,9 @@ jobs:
           export DISPLAY=:1
           export NO_AT_BRIDGE=1
           cd "$AHREF_DIR"
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --no-cache-dir -r requirements.txt
           nohup python3 ahrefs_checker.py --workers 1 --no-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
           CHECKER_PID=$!
           echo "  Checker PID: $CHECKER_PID (modes: ${AHREF_MODES})"
