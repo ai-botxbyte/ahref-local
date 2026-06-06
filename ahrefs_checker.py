@@ -22,9 +22,13 @@ killed.
 
 Usage:
     python ahrefs_checker.py [--modes MODES] [--api-url URL] [--headless] [--workers 5]
+                             [--chrome /path/to/chrome] [--extension /path/to/ext/folder]
 
     MODES is a comma-separated list (default: 'authority,traffic'). Set to
     a single value (e.g. 'traffic') to lock the worker to one queue.
+
+    --extension: directly pass the extension folder path — skips GitHub
+    profile download and Extensions/cf_autoclick/ folder structure entirely.
 """
 
 import argparse
@@ -64,16 +68,6 @@ DEFAULT_API_URL = "https://b-domain.articleinnovator.com/domain-metrics-manageme
 # --------------------------------------------------------------------------- #
 # Master profile (downloaded from GitHub release on every run)
 # --------------------------------------------------------------------------- #
-#
-# The release `worker-profile-v1` on sanket-sakariya/test-abc contains the
-# Chrome profile used by the workers, with the cf-autoclick extension already
-# baked into Extensions/cf_autoclick/. To rotate the profile, update the
-# release using tools/upload_profile_release.sh.
-#
-# Both the URL and the extracted-profile path can be overridden via env vars
-# — the GitHub Actions workflow pre-downloads the profile in its own step
-# and sets AHREF_MASTER_PROFILE_DIR so this script skips the redundant
-# download (faster watchdog restarts, cleaner workflow logs).
 PROFILE_RELEASE_URL = os.environ.get(
     "AHREF_PROFILE_RELEASE_URL",
     "https://github.com/sanket-sakariya/test-abc/releases/download/"
@@ -144,7 +138,6 @@ def _extract_traffic_row(parsed: Dict[str, Any], domain: str) -> Dict[str, Any]:
         row["top_keywords"] = r.get("top_keywords") or []
         row["top_pages"] = r.get("top_pages") or []
         row["turnstile_retries"] = r.get("turnstile_retries")
-        # A row counts as completed if we got at least the headline metric.
         if r.get("organic_traffic") is not None or r.get("traffic_value") is not None:
             row["status"] = "completed"
         elif r.get("error"):
@@ -194,32 +187,15 @@ _HTTP = _make_resilient_session()
 
 # ----------------------------------------------------------------------------
 # Master-profile bootstrap — download once per run from GitHub release.
+# Only used when --extension is NOT passed.
 # ----------------------------------------------------------------------------
 
 def _download_master_profile() -> str:
-    """Resolve the master Chrome profile, downloading it if necessary.
-
-    Resolution order:
-      1. In-process cache (already resolved on a previous call)
-      2. AHREF_MASTER_PROFILE_DIR env var pointing at an already-extracted
-         profile (the GitHub Actions workflow uses this to skip the download
-         after restarting the script)
-      3. Download + extract the GitHub release asset
-
-    Thread-safe via _MASTER_PROFILE_LOCK so workers launching concurrently
-    don't both try to download.
-
-    Raises RuntimeError if the asset is missing or the extracted dir does
-    not contain the cf-autoclick extension — fail fast rather than start
-    browsers without captcha-solving.
-    """
     global _MASTER_PROFILE_DIR
     with _MASTER_PROFILE_LOCK:
-        # (1) already resolved this run
         if _MASTER_PROFILE_DIR and os.path.isdir(_MASTER_PROFILE_DIR):
             return _MASTER_PROFILE_DIR
 
-        # (2) pre-extracted by the workflow — just verify and reuse.
         if PROFILE_PREEXTRACTED_DIR and os.path.isdir(PROFILE_PREEXTRACTED_DIR):
             ext_manifest = os.path.join(
                 PROFILE_PREEXTRACTED_DIR, "Extensions", "cf_autoclick", "manifest.json"
@@ -239,7 +215,6 @@ def _download_master_profile() -> str:
                 flush=True,
             )
 
-        # (3) fall through to download
         run_token = uuid.uuid4().hex[:8]
         download_path = os.path.join(tempfile.gettempdir(), f"ahref_master_{run_token}.zip")
         extract_root = os.path.join(tempfile.gettempdir(), f"ahref_master_{run_token}")
@@ -274,8 +249,6 @@ def _download_master_profile() -> str:
             except OSError:
                 pass
 
-        # The zip wraps a single top-level directory (e.g. "ahrefs-worker-profile").
-        # Find the real profile root — it must contain Extensions/cf_autoclick.
         candidates = [extract_root] + [
             os.path.join(extract_root, d) for d in os.listdir(extract_root)
             if os.path.isdir(os.path.join(extract_root, d))
@@ -300,29 +273,7 @@ def _download_master_profile() -> str:
 
 
 def _create_worker_profile(worker_id: int) -> str:
-    """Copy the master profile into a fresh per-worker directory.
-
-    Profile id format: ``ahref_w{worker_id}_{uuid8}`` so two concurrent
-    workers (or two restarts of the same worker_id within one run) never
-    fight over the same /tmp dir. Tracked in _CREATED_PROFILES so the
-    global cleanup hook can remove every one on process exit.
-
-    After copying we ALSO strip Chrome's MAC-protected pref files. Chrome
-    keeps an HMAC over Local State and Secure Preferences keyed to the OS
-    user-id of the machine that wrote them; when a profile is copied
-    across machines (laptop → server → /tmp/ahref_w0_xxx) the MAC stops
-    validating and Chrome silently:
-      - resets "sensitive" prefs back to defaults
-      - turns off extensions whose entries fell outside the validated MAC
-        scope (cf-autoclick is one — its `debugger` permission marks it
-        sensitive)
-      - logs "Reset due to invalid mac" internally
-
-    By deleting these files we force Chrome to regenerate them fresh
-    against the current machine identity — our --load-extension /
-    --disable-extensions-except flags then load cleanly because there's
-    no stale invalid MAC fighting them.
-    """
+    """Copy the master profile into a fresh per-worker directory."""
     master = _download_master_profile()
     profile_id = f"ahref_w{worker_id}_{uuid.uuid4().hex[:8]}"
     dest = os.path.join(tempfile.gettempdir(), profile_id)
@@ -332,22 +283,15 @@ def _create_worker_profile(worker_id: int) -> str:
 
     ext_manifest = os.path.join(dest, "Extensions", "cf_autoclick", "manifest.json")
     if not os.path.isfile(ext_manifest):
-        # Should be impossible given the master-profile check, but defend
-        # against a half-copied directory (disk full mid-copytree, etc.).
         shutil.rmtree(dest, ignore_errors=True)
         raise RuntimeError(
             f"[W{worker_id}] Per-worker profile missing cf-autoclick after copy: "
             f"{ext_manifest}"
         )
 
-    # Strip MAC-protected files — Chrome regenerates them on first launch.
-    # See docstring for rationale. We only nuke the files that hold MACs;
-    # the rest of the profile (cookies, extension files, history) survives.
     mac_files = [
         os.path.join(dest, "Local State"),
         os.path.join(dest, "Default", "Secure Preferences"),
-        # Preferences is NOT MAC-protected by itself but Chrome 120+ refuses
-        # to read it when Local State's MAC is missing — easier to wipe both.
         os.path.join(dest, "Default", "Preferences"),
     ]
     for f in mac_files:
@@ -360,6 +304,16 @@ def _create_worker_profile(worker_id: int) -> str:
     with _PROFILES_LOCK:
         _CREATED_PROFILES.append(dest)
 
+    return dest
+
+
+def _create_plain_profile(worker_id: int) -> str:
+    """Create a plain empty per-worker profile (used when --extension is passed directly)."""
+    profile_id = f"ahref_w{worker_id}_{uuid.uuid4().hex[:8]}"
+    dest = os.path.join(tempfile.gettempdir(), profile_id)
+    os.makedirs(dest, exist_ok=True)
+    with _PROFILES_LOCK:
+        _CREATED_PROFILES.append(dest)
     return dest
 
 
@@ -391,17 +345,12 @@ def _global_profile_cleanup() -> None:
             pass
     global _MASTER_PROFILE_DIR
     if _MASTER_PROFILE_DIR:
-        # Don't delete a master profile we didn't download (the GitHub
-        # Actions workflow pre-extracts to a fixed path and manages its
-        # own cleanup; nuking it here would break the watchdog restart).
         is_preextracted = (
             PROFILE_PREEXTRACTED_DIR
             and os.path.abspath(_MASTER_PROFILE_DIR) == os.path.abspath(PROFILE_PREEXTRACTED_DIR)
         )
         if not is_preextracted:
             try:
-                # also remove the extract_root one level up so we don't leak the
-                # ahref_master_<token> wrapper directory.
                 parent = os.path.dirname(_MASTER_PROFILE_DIR)
                 if parent.startswith(tempfile.gettempdir()) and "ahref_master_" in parent:
                     shutil.rmtree(parent, ignore_errors=True)
@@ -416,41 +365,33 @@ atexit.register(_global_profile_cleanup)
 
 
 def _install_signal_handlers() -> None:
-    """SIGTERM/SIGINT → flush profile cleanup then exit cleanly."""
     def _handler(signum, _frame):
         try:
             _global_profile_cleanup()
         finally:
-            # Re-raise default behavior so the process actually exits.
             sys.exit(128 + signum)
     for sig in (signal.SIGTERM, signal.SIGHUP):
         try:
             signal.signal(sig, _handler)
         except (ValueError, OSError):
-            # SIGHUP doesn't exist on Windows; non-main threads can't
-            # install handlers — both are fine to skip.
             pass
 
 
 # ----------------------------------------------------------------------------
-# Driver-build serialization — undetected_chromedriver patches its own
-# binary at runtime; concurrent uc.Chrome() calls cause the binary to vanish
-# (FileNotFoundError on /home/.../undetected_chromedriver). We serialize the
-# patching with a file lock and pre-cache the binary on first use.
+# Driver-build serialization
 # ----------------------------------------------------------------------------
 
 _DRIVER_BUILD_LOCK_PATH = "/tmp/uc_driver_build.lock"
-_driver_build_lock = threading.Lock()  # within-process
+_driver_build_lock = threading.Lock()
 
 UC_CACHE_DIR = os.path.expanduser("~/.local/share/undetected_chromedriver")
 
 
 def _acquire_driver_build_lock(timeout: float = 60.0) -> Optional[Any]:
-    """Cross-process lock around uc.Chrome() construction."""
     try:
         import fcntl
     except ImportError:
-        return None  # OS doesn't support flock — best effort
+        return None
     deadline = time.time() + timeout
     fh = open(_DRIVER_BUILD_LOCK_PATH, "w")
     while time.time() < deadline:
@@ -478,7 +419,6 @@ def _release_driver_build_lock(fh: Optional[Any]) -> None:
 
 
 def load_mode_js(spec_path: str) -> str:
-    """Load the 'evaluate' script from an ahrefs JSON spec file."""
     with open(spec_path, "r", encoding="utf-8") as fh:
         spec = json.load(fh)
     action = next((a for a in spec.get("actions", []) if a.get("type") == "evaluate"), None)
@@ -498,7 +438,13 @@ def find_chrome_binary() -> Optional[str]:
     system = platform.system()
     candidates = []
     if system == "Linux":
-        candidates = ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium-browser"]
+        candidates = [
+            "/usr/bin/ungoogled-chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+        ]
     elif system == "Darwin":
         candidates = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
     elif system == "Windows":
@@ -525,7 +471,6 @@ def detect_chrome_major(chrome_binary: Optional[str]) -> Optional[int]:
 
 
 def _free_port() -> int:
-    """Pick an unused TCP port to avoid chromedriver port races between concurrent instances."""
     import socket
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -535,25 +480,26 @@ def _free_port() -> int:
 
 
 def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
-                 version_main: Optional[int], proxy: Optional[str] = None):
-    """Build a uc.Chrome driver using a fresh per-worker profile copy.
+                 version_main: Optional[int], proxy: Optional[str] = None,
+                 extension_path: Optional[str] = None):
+    """Build a uc.Chrome driver.
 
-    Returns (driver, profile_path) so the caller can clean up the profile
-    when the driver is recycled / shut down.
+    If extension_path is provided (via --extension CLI arg), load the
+    extension directly via --load-extension without needing a master profile
+    or GitHub download. Otherwise falls back to the original master-profile
+    flow.
+
+    Returns (driver, profile_path).
     """
     import undetected_chromedriver as uc
 
-    # 1. Cross-process lock — undetected_chromedriver writes to a shared
-    #    binary in ~/.local/share/undetected_chromedriver. Two workers
-    #    patching at the same time can leave one with FileNotFoundError.
     file_lock = _acquire_driver_build_lock(timeout=120.0)
-
-    # 2. In-process lock as a second layer (cheap)
     with _driver_build_lock:
         try:
             return _build_driver_locked(
                 worker_id, headless=headless, chrome_binary=chrome_binary,
                 version_main=version_main, proxy=proxy, uc=uc,
+                extension_path=extension_path,
             )
         finally:
             _release_driver_build_lock(file_lock)
@@ -561,7 +507,7 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
 
 def _build_driver_locked(worker_id: int, headless: bool, chrome_binary: Optional[str],
                          version_main: Optional[int], proxy: Optional[str],
-                         uc):
+                         uc, extension_path: Optional[str] = None):
     opts = uc.ChromeOptions()
     opts.page_load_strategy = "eager"
     opts.add_argument("--no-first-run")
@@ -572,37 +518,31 @@ def _build_driver_locked(worker_id: int, headless: bool, chrome_binary: Optional
     opts.add_argument("--window-size=1280,900")
     opts.add_argument(f"--remote-debugging-port={_free_port()}")
 
-    # Per-worker, per-run profile — replicated from the GitHub master profile.
-    # cf-autoclick extension is already inside Extensions/cf_autoclick/ thanks
-    # to the master profile bake.
-    profile = _create_worker_profile(worker_id)
-    print(f"  [worker-{worker_id}] Profile: {profile}", flush=True)
-
-    ext_dest = os.path.join(profile, "Extensions", "cf_autoclick")
-    if os.path.isdir(ext_dest):
-        # Chrome 117+ silently ignores --load-extension unless one of these
-        # is also true:
-        #   (a) Developer Mode is enabled in Preferences, OR
-        #   (b) --disable-extensions-except is also passed with the same path
-        #
-        # We can't rely on (a) — the master profile is built on a different
-        # machine and Chrome resets sensitive prefs (including dev mode) when
-        # the profile is copied across users due to the HMAC on Local State
-        # and Secure Preferences not validating.
-        #
-        # (b) bypasses dev-mode entirely AND survives the auto-disable check
-        # that Chrome runs on extensions holding privileged permissions like
-        # `debugger` (which cf-autoclick uses). Both flags must point at the
-        # same absolute path.
-        opts.add_argument(f"--load-extension={ext_dest}")
-        opts.add_argument(f"--disable-extensions-except={ext_dest}")
-        print(f"  [worker-{worker_id}] Loading extension: {ext_dest}", flush=True)
+    # ── Extension + Profile loading ───────────────────────────────────────
+    if extension_path and os.path.isdir(extension_path):
+        # --extension passed directly via CLI — skip GitHub download and
+        # master profile entirely. Just create a plain empty profile and
+        # load the extension straight from the given path.
+        ext_abs = os.path.abspath(extension_path)
+        opts.add_argument(f"--load-extension={ext_abs}")
+        opts.add_argument(f"--disable-extensions-except={ext_abs}")
+        profile = _create_plain_profile(worker_id)
+        print(f"  [worker-{worker_id}] Loading extension directly: {ext_abs}", flush=True)
+        print(f"  [worker-{worker_id}] Profile: {profile}", flush=True)
     else:
-        # Defensive — _create_worker_profile already verifies the manifest
-        # exists and raises if not, so reaching here means something deleted
-        # the dir between copy and driver build.
-        print(f"  [worker-{worker_id}] WARNING: extension dir missing at {ext_dest}",
-              flush=True)
+        # Original flow — copy from master profile (GitHub download or
+        # AHREF_MASTER_PROFILE_DIR env var).
+        profile = _create_worker_profile(worker_id)
+        print(f"  [worker-{worker_id}] Profile: {profile}", flush=True)
+        ext_dest = os.path.join(profile, "Extensions", "cf_autoclick")
+        if os.path.isdir(ext_dest):
+            opts.add_argument(f"--load-extension={ext_dest}")
+            opts.add_argument(f"--disable-extensions-except={ext_dest}")
+            print(f"  [worker-{worker_id}] Loading extension from profile: {ext_dest}", flush=True)
+        else:
+            print(f"  [worker-{worker_id}] WARNING: extension dir missing at {ext_dest}",
+                  flush=True)
+    # ─────────────────────────────────────────────────────────────────────
 
     if chrome_binary:
         opts.binary_location = chrome_binary
@@ -653,7 +593,6 @@ _UC_BIN_BACKUP = "/tmp/uc_chromedriver.backup"
 
 
 def _ensure_uc_binary_present() -> None:
-    """If our backup exists but the canonical UC binary is missing, restore it."""
     try:
         os.makedirs(UC_CACHE_DIR, exist_ok=True)
     except Exception:
@@ -666,12 +605,11 @@ def _ensure_uc_binary_present() -> None:
             shutil.copy2(_UC_BIN_BACKUP, canonical)
             os.chmod(canonical, 0o755)
             print(f"  [uc-cache] restored chromedriver from backup", flush=True)
-        except Exception as e:  # pragma: no cover
+        except Exception as e:
             print(f"  [uc-cache] restore failed: {e}", flush=True)
 
 
 def _snapshot_uc_binary() -> None:
-    """Snapshot the patched UC binary to /tmp so we can restore on next run."""
     canonical = os.path.join(UC_CACHE_DIR, "undetected_chromedriver")
     if not os.path.exists(canonical):
         return
@@ -733,9 +671,6 @@ def scrape_domain(driver, domain: str, mode: CheckerMode) -> Dict[str, Any]:
         """
         driver.execute_script(kickoff_js)
 
-        # Traffic-checker scrapes a modal that takes longer to load than the
-        # authority check (multiple sections, table rendering, recharts SVG).
-        # Give it more time before giving up.
         poll_deadline = time.time() + (120 if mode.name == "traffic" else 60)
         last_click = 0.0
 
@@ -791,7 +726,6 @@ def tprint(msg):
 
 
 def pull_domain(api_url: str, mode: CheckerMode) -> Optional[Dict[str, Any]]:
-    """Pull a single domain from the queue. Uses resilient session for retries."""
     try:
         resp = _HTTP.get(f"{api_url}{mode.endpoint}", timeout=(10, 30))
         if resp.status_code == 204:
@@ -809,7 +743,6 @@ def pull_domain(api_url: str, mode: CheckerMode) -> Optional[Dict[str, Any]]:
 
 
 def post_result(api_url: str, mode: CheckerMode, execution_record: Dict, result: Dict) -> bool:
-    """Post a single result. Failed results are buffered to disk."""
     try:
         resp = _HTTP.post(
             f"{api_url}{mode.endpoint}",
@@ -828,9 +761,7 @@ def post_result(api_url: str, mode: CheckerMode, execution_record: Dict, result:
 
 
 # ----------------------------------------------------------------------------
-# Persistent post buffer — never lose a result.
-# We use a per-mode buffer file so authority results and traffic results
-# don't get re-sent to the wrong endpoint after a crash.
+# Persistent post buffer
 # ----------------------------------------------------------------------------
 
 def _ahref_post_buffer_path(mode: CheckerMode) -> str:
@@ -852,7 +783,7 @@ def _buffer_ahref_failed_post(mode: CheckerMode, execution_record: Dict, result:
                     "execution_record": execution_record,
                     "result": result,
                 }) + "\n")
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         print(f"  [buffer] FATAL: cannot write ahref post buffer: {e}", flush=True)
 
 
@@ -893,7 +824,7 @@ def _flush_pending_ahref_posts(api_url: str, mode: CheckerMode, max_per_run: int
             with open(buf_path, "w", encoding="utf-8") as fh:
                 for ln in remaining:
                     fh.write(ln + "\n")
-        except Exception:  # pragma: no cover
+        except Exception:
             pass
     return flushed
 
@@ -914,11 +845,10 @@ def _start_ahref_buffer_flusher(api_url: str, mode: CheckerMode) -> threading.Th
 
 
 # ----------------------------------------------------------------------------
-# Browser healthcheck — detect dead drivers proactively
+# Browser healthcheck
 # ----------------------------------------------------------------------------
 
 def _is_driver_alive(driver) -> bool:
-    """Return True if `driver` can execute a trivial script."""
     if driver is None:
         return False
     try:
@@ -929,20 +859,8 @@ def _is_driver_alive(driver) -> bool:
 
 def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bool,
                 chrome_bin: Optional[str], version_main: Optional[int],
-                modes: List[CheckerMode]):
-    """Single worker: opens browser with proxy, pulls and processes domains forever.
-
-    The worker is **mode-agnostic**. On each iteration it tries each enabled
-    mode's pull endpoint in round-robin order; the first one to return a
-    record dictates which JS / target URL / extractor to use for that
-    domain. Both queues feed the same browser, so the workflow doesn't have
-    to pick a mode upfront — whichever queue has work, the worker picks it
-    up.
-
-    The round-robin offset is per-worker (`worker_id % len(modes)`) so
-    multiple workers don't all hammer the same endpoint first; on average
-    each endpoint sees fair attention even when only one queue has work.
-    """
+                modes: List[CheckerMode], extension_path: Optional[str] = None):
+    """Single worker: opens browser, pulls and processes domains forever."""
     proxy_short = proxy.split(":")[0] if proxy else "local"
     mode_names = ",".join(m.name for m in modes)
     tprint(f"  [W{worker_id}] Starting [modes={mode_names}] with proxy {proxy_short}...")
@@ -950,15 +868,10 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
     driver = None
     profile_path: Optional[str] = None
     processed = 0
-    # Per-worker round-robin offset — incremented each time we have to try
-    # multiple endpoints, so the next pull starts where the last one left off.
     rr_offset = worker_id % max(1, len(modes))
 
     def start_browser():
-        """Build the driver with up to 10 retries with exponential backoff."""
         nonlocal driver, profile_path
-        # Tear down previous driver + profile before rebuilding so we don't
-        # leak per-run uuid dirs across recycles.
         if driver:
             try:
                 driver.quit()
@@ -976,6 +889,7 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
                 driver, profile_path = build_driver(
                     worker_id, headless=headless, chrome_binary=chrome_bin,
                     version_main=version_main, proxy=proxy,
+                    extension_path=extension_path,
                 )
                 if _is_driver_alive(driver):
                     break
@@ -989,8 +903,6 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
                 except Exception:
                     pass
                 driver = None
-                # The failed attempt may have already created a profile dir;
-                # remove it before retry so we don't accumulate orphans.
                 if profile_path:
                     _remove_worker_profile(profile_path)
                     profile_path = None
@@ -1005,17 +917,12 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
         tprint(f"  [W{worker_id}] Browser ready (proxy: {proxy_short}, profile: {profile_path})")
 
     def _pull_any() -> Optional[tuple]:
-        """Try each enabled mode in round-robin order. Return (mode, record)
-        for the first hit, or None if every endpoint returned 204."""
         nonlocal rr_offset
         n = len(modes)
         for i in range(n):
             mode = modes[(rr_offset + i) % n]
             record = pull_domain(api_url, mode)
             if record is not None:
-                # Advance the offset so the NEXT pull starts on the queue we
-                # didn't just drain — keeps the two queues balanced even when
-                # one is much busier than the other.
                 rr_offset = (rr_offset + i + 1) % n
                 return mode, record
         return None
@@ -1069,14 +976,9 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
                     raise
                 result = {"domain_name": domain, "status": "error", "error": str(e)}
 
-            # POST goes back to the SAME endpoint we pulled from — the result
-            # has the shape that endpoint expects (the management service's
-            # POST handler unpacks fields specific to its mode).
             post_result(api_url, mode, record, result)
             processed += 1
 
-            # Proactive recycle every 50 domains. start_browser() handles
-            # tearing down the old profile + creating a new uuid'd one.
             if processed > 0 and processed % 50 == 0:
                 tprint(f"  [W{worker_id}] processed {processed} — recycling browser")
                 try:
@@ -1094,9 +996,6 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
                 driver.quit()
             except Exception:
                 pass
-        # Final per-worker cleanup. The global atexit hook will also catch
-        # this if we crash before reaching here, but doing it explicitly
-        # frees ~150 MB per worker faster.
         if profile_path:
             _remove_worker_profile(profile_path)
             tprint(f"  [W{worker_id}] Cleaned up profile {profile_path}")
@@ -1107,25 +1006,26 @@ def main():
     p = argparse.ArgumentParser(
         description="Ahrefs Checker — Parallel Pull Mode. By default the worker "
                     "polls BOTH /ahref-authority/ and /ahref-traffic/ in round-robin "
-                    "and processes whichever queue has a message — the workflow "
-                    "doesn't need to pick a mode upfront.",
+                    "and processes whichever queue has a message.",
     )
     p.add_argument("--api-url", default=DEFAULT_API_URL)
     p.add_argument("--modes", default="authority,traffic",
                    help="Comma-separated list of Ahrefs checks to pull (default: "
-                        "'authority,traffic' — both queues). Set to 'authority' or "
-                        "'traffic' alone to lock the worker to one queue.")
+                        "'authority,traffic'). Set to 'authority' or 'traffic' to "
+                        "lock the worker to one queue.")
     p.add_argument("--mode", choices=list(MODES.keys()),
-                   help="DEPRECATED — use --modes. Single-mode shortcut kept for "
-                        "backwards compatibility; equivalent to --modes <value>.")
+                   help="DEPRECATED — use --modes.")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--workers", type=int, default=5, help="Number of parallel browser instances")
-    p.add_argument("--chrome", help="Path to chrome binary")
+    p.add_argument("--chrome", help="Path to chrome/chromium binary")
+    p.add_argument("--extension", help="Direct path to unpacked extension folder "
+                                       "(e.g. ~/Downloads/cf-autoclick-master). "
+                                       "Skips GitHub profile download entirely.")
     p.add_argument("--proxies", default=PROXIES_PATH, help="Path to proxies file")
-    p.add_argument("--no-proxy", action="store_true", help="Disable proxies, run all instances on local IP")
+    p.add_argument("--no-proxy", action="store_true", help="Disable proxies")
     args = p.parse_args()
 
-    # --mode is deprecated but still respected; --modes wins if both given.
+    # Resolve --modes / --mode
     raw_modes = args.modes if args.modes else (args.mode or "authority,traffic")
     requested = [m.strip().lower() for m in raw_modes.split(",") if m.strip()]
     unknown = [m for m in requested if m not in MODES]
@@ -1140,14 +1040,28 @@ def main():
 
     _install_signal_handlers()
 
-    # Pre-download the master profile once before any worker starts, so a
-    # download failure aborts the run before we burn cycles spinning up
-    # ThreadPoolExecutor and partially-initialized workers.
-    try:
-        _download_master_profile()
-    except Exception as e:
-        print(f"[FATAL] Cannot bootstrap master profile: {e}", file=sys.stderr)
-        sys.exit(2)
+    # Validate --extension path if provided
+    extension_path: Optional[str] = None
+    if args.extension:
+        extension_path = os.path.abspath(os.path.expanduser(args.extension))
+        if not os.path.isdir(extension_path):
+            print(f"[FATAL] --extension path does not exist or is not a directory: {extension_path}",
+                  file=sys.stderr)
+            sys.exit(2)
+        manifest = os.path.join(extension_path, "manifest.json")
+        if not os.path.isfile(manifest):
+            print(f"[FATAL] --extension folder has no manifest.json: {extension_path}",
+                  file=sys.stderr)
+            sys.exit(2)
+        print(f"[*] Extension: {extension_path} (direct --load-extension, skipping GitHub profile)",
+              flush=True)
+    else:
+        # Only download master profile when --extension is NOT passed
+        try:
+            _download_master_profile()
+        except Exception as e:
+            print(f"[FATAL] Cannot bootstrap master profile: {e}", file=sys.stderr)
+            sys.exit(2)
 
     proxies = [] if args.no_proxy else load_proxies()
     num_workers = args.workers
@@ -1166,9 +1080,6 @@ def main():
     print(f"[*] Workers: {num_workers} | Proxy: {'disabled' if args.no_proxy or not proxies else f'{len(proxies)} loaded'}")
     print(f"[*] Launching {num_workers} browser instances...\n")
 
-    # Flush any results buffered from a previous crashed run for EACH enabled
-    # mode (each has its own per-mode buffer file), then start a flusher
-    # thread per mode so ongoing failed POSTs drain in the background.
     for mode in enabled_modes:
         initial = _flush_pending_ahref_posts(args.api_url, mode, max_per_run=200)
         if initial:
@@ -1182,9 +1093,10 @@ def main():
             f = executor.submit(
                 worker_loop, i, proxy, args.api_url, args.headless,
                 chrome_bin, version_main, enabled_modes,
+                extension_path,  # passed directly to each worker
             )
             futures.append(f)
-            time.sleep(10)  # Stagger launches to avoid resource contention / chromedriver port races
+            time.sleep(10)
 
         try:
             for f in futures:
