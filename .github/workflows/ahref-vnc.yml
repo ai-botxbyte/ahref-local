@@ -2,14 +2,6 @@ name: Ahref Checker VNC
 
 on:
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'Checker mode (which Ahrefs queue to pull from)'
-        type: choice
-        default: authority
-        options:
-          - authority
-          - traffic
 
 env:
   DISPLAY: ":1"
@@ -17,7 +9,8 @@ env:
   NOVNC_PORT: 6080
   VNC_PASSWORD: "botxbyte123"
   AHREF_DIR: "/home/runner/ahref-local"
-  AHREF_MODE: ${{ inputs.mode }}
+  # The script auto-routes between both queues — workflow doesn't pick.
+  AHREF_MODES: "authority,traffic"
   # Master profile asset hosted on the test-abc GitHub release. ahrefs_checker.py
   # would download this itself on every run, but pre-downloading here gives
   # cleaner workflow logs and lets the watchdog restart the script instantly
@@ -248,17 +241,17 @@ jobs:
 
       - name: Start Ahref Checker
         run: |
-          echo "Starting ahrefs_checker.py (mode=${AHREF_MODE}, 1 worker, no proxy)..."
+          echo "Starting ahrefs_checker.py (modes=${AHREF_MODES}, 1 worker, no proxy)..."
           export DISPLAY=:1
           export NO_AT_BRIDGE=1
           cd "$AHREF_DIR"
-          nohup python3 ahrefs_checker.py --workers 1 --no-proxy --mode "${AHREF_MODE}" > /tmp/ahref-checker.log 2>&1 &
+          nohup python3 ahrefs_checker.py --workers 1 --no-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
           CHECKER_PID=$!
-          echo "  Checker PID: $CHECKER_PID (mode: ${AHREF_MODE})"
+          echo "  Checker PID: $CHECKER_PID (modes: ${AHREF_MODES})"
           sleep 5
 
           if kill -0 $CHECKER_PID 2>/dev/null; then
-            echo "✅ Ahref checker started (PID: $CHECKER_PID, mode: ${AHREF_MODE})"
+            echo "✅ Ahref checker started (PID: $CHECKER_PID, modes: ${AHREF_MODES})"
           else
             echo "❌ Ahref checker failed to start"; cat /tmp/ahref-checker.log; exit 1
           fi
@@ -273,7 +266,8 @@ jobs:
           echo "🌐 VNC Access URL: ${{ steps.tunnel.outputs.tunnel_url }}/vnc.html"
           echo "🔑 Password: botxbyte123"
           echo ""
-          echo "🐍 ahrefs_checker.py running with: --workers 1 --no-proxy --mode ${AHREF_MODE}"
+          echo "🐍 ahrefs_checker.py running with: --workers 1 --no-proxy --modes ${AHREF_MODES}"
+          echo "    (auto-routes between authority and traffic queues — whichever has work)"
           echo ""
 
       - name: Keep Session Alive
@@ -283,7 +277,7 @@ jobs:
           echo "Keeping VNC session alive..."
 
           while true; do
-            echo "🌐 VNC: ${{ steps.tunnel.outputs.tunnel_url }}/vnc.html | Password: botxbyte123 | Mode: ${AHREF_MODE}"
+            echo "🌐 VNC: ${{ steps.tunnel.outputs.tunnel_url }}/vnc.html | Password: botxbyte123 | Modes: ${AHREF_MODES}"
 
             # Restart VNC if it died
             if ! pgrep -f "Xvnc.*:1" > /dev/null; then
@@ -299,16 +293,16 @@ jobs:
               sleep 5
             fi
 
-            # Restart checker if it died — use the same mode the workflow was dispatched with.
+            # Restart checker if it died — same modes the workflow was configured with.
             # AHREF_MASTER_PROFILE_DIR is exported via the workflow `env`, so the
             # restarted process reuses the already-downloaded master profile and
             # skips re-downloading it from GitHub.
             if ! pgrep -f "ahrefs_checker.py" > /dev/null; then
-              echo "⚠️ Ahref checker stopped! Restarting (mode: ${AHREF_MODE}, profile: ${AHREF_MASTER_PROFILE_DIR})..."
+              echo "⚠️ Ahref checker stopped! Restarting (modes: ${AHREF_MODES}, profile: ${AHREF_MASTER_PROFILE_DIR})..."
               export DISPLAY=:1
               export NO_AT_BRIDGE=1
               cd "$AHREF_DIR"
-              nohup python3 ahrefs_checker.py --workers 1 --no-proxy --mode "${AHREF_MODE}" > /tmp/ahref-checker.log 2>&1 &
+              nohup python3 ahrefs_checker.py --workers 1 --no-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
               sleep 3
             fi
 

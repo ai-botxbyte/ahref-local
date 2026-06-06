@@ -1,12 +1,17 @@
 """
-Ahrefs Pull-based Checker — supports authority OR traffic mode.
+Ahrefs Pull-based Checker — auto-routes between authority and traffic queues.
 
 Each worker gets its own per-run Chrome profile (replicated from a master
 profile downloaded from a GitHub release on every start), runs a browser,
-and pulls execution records from one of two pull-based endpoints:
+and pulls execution records from BOTH pull-based endpoints in round-robin:
 
-  --mode authority  →  GET/POST /ahref-authority/   (default)
-  --mode traffic    →  GET/POST /ahref-traffic/
+  GET/POST /ahref-authority/   (authority queue)
+  GET/POST /ahref-traffic/     (traffic queue)
+
+Whichever endpoint returns a record dictates which JS / target URL /
+extractor is used to scrape that one domain — the workflow doesn't have
+to pick a mode upfront. Both queues feed the same browser; if only one
+queue has work, the worker drains it and idles on the other.
 
 The master profile is downloaded once per run from a GitHub release and
 contains the cf-autoclick extension pre-installed. Every worker copies it
@@ -16,7 +21,10 @@ the master cache) are cleaned up when the worker exits or the process is
 killed.
 
 Usage:
-    python ahrefs_checker.py [--mode {authority,traffic}] [--api-url URL] [--headless] [--workers 5]
+    python ahrefs_checker.py [--modes MODES] [--api-url URL] [--headless] [--workers 5]
+
+    MODES is a comma-separated list (default: 'authority,traffic'). Set to
+    a single value (e.g. 'traffic') to lock the worker to one queue.
 """
 
 import argparse
@@ -865,14 +873,31 @@ def _is_driver_alive(driver) -> bool:
 
 
 def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bool,
-                chrome_bin: Optional[str], version_main: Optional[int], mode: CheckerMode):
-    """Single worker: opens browser with proxy, pulls and processes domains forever."""
+                chrome_bin: Optional[str], version_main: Optional[int],
+                modes: List[CheckerMode]):
+    """Single worker: opens browser with proxy, pulls and processes domains forever.
+
+    The worker is **mode-agnostic**. On each iteration it tries each enabled
+    mode's pull endpoint in round-robin order; the first one to return a
+    record dictates which JS / target URL / extractor to use for that
+    domain. Both queues feed the same browser, so the workflow doesn't have
+    to pick a mode upfront — whichever queue has work, the worker picks it
+    up.
+
+    The round-robin offset is per-worker (`worker_id % len(modes)`) so
+    multiple workers don't all hammer the same endpoint first; on average
+    each endpoint sees fair attention even when only one queue has work.
+    """
     proxy_short = proxy.split(":")[0] if proxy else "local"
-    tprint(f"  [W{worker_id}] Starting [{mode.name}] with proxy {proxy_short}...")
+    mode_names = ",".join(m.name for m in modes)
+    tprint(f"  [W{worker_id}] Starting [modes={mode_names}] with proxy {proxy_short}...")
 
     driver = None
     profile_path: Optional[str] = None
     processed = 0
+    # Per-worker round-robin offset — incremented each time we have to try
+    # multiple endpoints, so the next pull starts where the last one left off.
+    rr_offset = worker_id % max(1, len(modes))
 
     def start_browser():
         """Build the driver with up to 10 retries with exponential backoff."""
@@ -924,6 +949,22 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
             pass
         tprint(f"  [W{worker_id}] Browser ready (proxy: {proxy_short}, profile: {profile_path})")
 
+    def _pull_any() -> Optional[tuple]:
+        """Try each enabled mode in round-robin order. Return (mode, record)
+        for the first hit, or None if every endpoint returned 204."""
+        nonlocal rr_offset
+        n = len(modes)
+        for i in range(n):
+            mode = modes[(rr_offset + i) % n]
+            record = pull_domain(api_url, mode)
+            if record is not None:
+                # Advance the offset so the NEXT pull starts on the queue we
+                # didn't just drain — keeps the two queues balanced even when
+                # one is much busier than the other.
+                rr_offset = (rr_offset + i + 1) % n
+                return mode, record
+        return None
+
     try:
         start_browser()
         last_healthcheck = time.time()
@@ -936,24 +977,26 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
                     start_browser()
                 last_healthcheck = now
 
-            record = pull_domain(api_url, mode)
+            pull_result = _pull_any()
 
-            if record is None:
+            if pull_result is None:
                 time.sleep(3 + random.random() * 2)
                 continue
 
+            mode, record = pull_result
             domain = record.get("domain_name", "unknown")
             execution_id = record.get("execution_id", "?")[:8]
-            tprint(f"  [W{worker_id}] Got: {domain} (exec: {execution_id})")
+            tprint(f"  [W{worker_id}] Got [{mode.name}]: {domain} (exec: {execution_id})")
 
             try:
                 result = scrape_domain(driver, domain, mode)
                 mark = "OK" if result["status"] == "completed" else "FAIL"
                 if mode.name == "authority":
-                    tprint(f"  [W{worker_id}] [{mark}] {domain} DR={result.get('dr', '-')} "
-                           f"BL={result.get('backlinks', '-')} ({result['elapsed_seconds']:.1f}s)")
+                    tprint(f"  [W{worker_id}] [{mark}][{mode.name}] {domain} "
+                           f"DR={result.get('dr', '-')} BL={result.get('backlinks', '-')} "
+                           f"({result['elapsed_seconds']:.1f}s)")
                 else:
-                    tprint(f"  [W{worker_id}] [{mark}] {domain} "
+                    tprint(f"  [W{worker_id}] [{mark}][{mode.name}] {domain} "
                            f"OT={result.get('organic_traffic', '-')} "
                            f"TV={result.get('traffic_value', '-')} "
                            f"({result['elapsed_seconds']:.1f}s)")
@@ -971,6 +1014,9 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
                     raise
                 result = {"domain_name": domain, "status": "error", "error": str(e)}
 
+            # POST goes back to the SAME endpoint we pulled from — the result
+            # has the shape that endpoint expects (the management service's
+            # POST handler unpacks fields specific to its mode).
             post_result(api_url, mode, record, result)
             processed += 1
 
@@ -1003,10 +1049,20 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
 
 
 def main():
-    p = argparse.ArgumentParser(description="Ahrefs Checker - Parallel Pull Mode (authority|traffic)")
+    p = argparse.ArgumentParser(
+        description="Ahrefs Checker — Parallel Pull Mode. By default the worker "
+                    "polls BOTH /ahref-authority/ and /ahref-traffic/ in round-robin "
+                    "and processes whichever queue has a message — the workflow "
+                    "doesn't need to pick a mode upfront.",
+    )
     p.add_argument("--api-url", default=DEFAULT_API_URL)
-    p.add_argument("--mode", choices=list(MODES.keys()), default="authority",
-                   help="Which Ahrefs check to pull: authority (default) or traffic")
+    p.add_argument("--modes", default="authority,traffic",
+                   help="Comma-separated list of Ahrefs checks to pull (default: "
+                        "'authority,traffic' — both queues). Set to 'authority' or "
+                        "'traffic' alone to lock the worker to one queue.")
+    p.add_argument("--mode", choices=list(MODES.keys()),
+                   help="DEPRECATED — use --modes. Single-mode shortcut kept for "
+                        "backwards compatibility; equivalent to --modes <value>.")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--workers", type=int, default=5, help="Number of parallel browser instances")
     p.add_argument("--chrome", help="Path to chrome binary")
@@ -1014,7 +1070,18 @@ def main():
     p.add_argument("--no-proxy", action="store_true", help="Disable proxies, run all instances on local IP")
     args = p.parse_args()
 
-    mode = MODES[args.mode]
+    # --mode is deprecated but still respected; --modes wins if both given.
+    raw_modes = args.modes if args.modes else (args.mode or "authority,traffic")
+    requested = [m.strip().lower() for m in raw_modes.split(",") if m.strip()]
+    unknown = [m for m in requested if m not in MODES]
+    if unknown:
+        print(f"[FATAL] Unknown mode(s): {unknown}. Valid: {list(MODES.keys())}",
+              file=sys.stderr)
+        sys.exit(2)
+    if not requested:
+        print(f"[FATAL] No modes given. Pass --modes authority,traffic.", file=sys.stderr)
+        sys.exit(2)
+    enabled_modes = [MODES[m] for m in requested]
 
     _install_signal_handlers()
 
@@ -1036,19 +1103,22 @@ def main():
     chrome_bin = args.chrome or find_chrome_binary()
     version_main = detect_chrome_major(chrome_bin)
 
+    mode_summary = ", ".join(f"{m.name}->{m.endpoint}" for m in enabled_modes)
     print(f"[*] Ahrefs Checker - Parallel Pull Mode")
-    print(f"[*] Mode: {mode.name} (endpoint: {mode.endpoint})")
+    print(f"[*] Modes: {mode_summary}")
     print(f"[*] API: {args.api_url}")
     print(f"[*] Chrome: {chrome_bin}")
     print(f"[*] Workers: {num_workers} | Proxy: {'disabled' if args.no_proxy or not proxies else f'{len(proxies)} loaded'}")
     print(f"[*] Launching {num_workers} browser instances...\n")
 
-    # Flush any results buffered from a previous crashed run, then start the
-    # background flusher to handle ongoing buffer drains.
-    initial = _flush_pending_ahref_posts(args.api_url, mode, max_per_run=200)
-    if initial:
-        print(f"[*] Recovered {initial} buffered {mode.name} posts from previous run")
-    _start_ahref_buffer_flusher(args.api_url, mode)
+    # Flush any results buffered from a previous crashed run for EACH enabled
+    # mode (each has its own per-mode buffer file), then start a flusher
+    # thread per mode so ongoing failed POSTs drain in the background.
+    for mode in enabled_modes:
+        initial = _flush_pending_ahref_posts(args.api_url, mode, max_per_run=200)
+        if initial:
+            print(f"[*] Recovered {initial} buffered {mode.name} posts from previous run")
+        _start_ahref_buffer_flusher(args.api_url, mode)
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = []
@@ -1056,7 +1126,7 @@ def main():
             proxy = proxies[i % len(proxies)] if proxies else None
             f = executor.submit(
                 worker_loop, i, proxy, args.api_url, args.headless,
-                chrome_bin, version_main, mode,
+                chrome_bin, version_main, enabled_modes,
             )
             futures.append(f)
             time.sleep(10)  # Stagger launches to avoid resource contention / chromedriver port races
