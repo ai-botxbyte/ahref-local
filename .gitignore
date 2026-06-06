@@ -24,3 +24,8 @@ results_500.json
 results_500.summary.json
 serverless.yml
 .serverless.yml
+
+# Local-only master profile staging area (built by tools/open_chrome_profile.sh,
+# uploaded to GitHub release by tools/upload_profile_release.sh — never commit)
+master-profile/
+master-profile.zip
