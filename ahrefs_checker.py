@@ -58,6 +58,13 @@ try:
 except ImportError:  # pragma: no cover
     from requests.packages.urllib3.util.retry import Retry  # type: ignore
 
+WEBSHARE_API_KEY = os.environ.get("WEBSHARE_API_KEY", "9ulqjlekme1514dwfi7p6lwm9kmvygshn5brii5s")
+WEBSHARE_PROXY_HOST = "p.webshare.io"
+WEBSHARE_PROXY_PORT = "9999"
+
+# Track authorized IP for cleanup
+_WEBSHARE_AUTH_ID: Optional[int] = None
+
 AHREFS_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ahrefs.json")
 AHREFS_TRAFFIC_JSON_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "ahrefs-traffic-checker.json"
@@ -183,6 +190,69 @@ def _make_resilient_session() -> requests.Session:
 
 
 _HTTP = _make_resilient_session()
+
+
+# ----------------------------------------------------------------------------
+# Webshare IP Authorization
+# ----------------------------------------------------------------------------
+
+def webshare_get_my_ip() -> str:
+    """Get the public IP of this machine."""
+    resp = requests.get("https://api.ipify.org", timeout=10)
+    resp.raise_for_status()
+    return resp.text.strip()
+
+
+def webshare_authorize_ip(ip: str) -> int:
+    """Authorize IP with Webshare. Returns the authorization ID."""
+    global _WEBSHARE_AUTH_ID
+    resp = requests.post(
+        "https://proxy.webshare.io/api/v2/proxy/ipauthorization/",
+        json={"ip_address": ip},
+        headers={"Authorization": f"Token {WEBSHARE_API_KEY}"},
+        timeout=15,
+    )
+    if resp.status_code == 400 and "already" in resp.text.lower():
+        # IP already authorized — find its ID
+        list_resp = requests.get(
+            "https://proxy.webshare.io/api/v2/proxy/ipauthorization/",
+            headers={"Authorization": f"Token {WEBSHARE_API_KEY}"},
+            timeout=15,
+        )
+        list_resp.raise_for_status()
+        for entry in list_resp.json().get("results", []):
+            if entry.get("ip_address") == ip:
+                _WEBSHARE_AUTH_ID = entry["id"]
+                print(f"✅ IP {ip} already authorized (id={_WEBSHARE_AUTH_ID})", flush=True)
+                return _WEBSHARE_AUTH_ID
+        # Fallback — can't find but it's authorized, set None so we don't delete
+        print(f"⚠️  IP {ip} reportedly authorized but not found in list", flush=True)
+        return 0
+    resp.raise_for_status()
+    data = resp.json()
+    _WEBSHARE_AUTH_ID = data["id"]
+    print(f"✅ Authorized IP {ip} with Webshare (id={_WEBSHARE_AUTH_ID})", flush=True)
+    return _WEBSHARE_AUTH_ID
+
+
+def webshare_deauthorize_ip() -> None:
+    """Remove the authorized IP from Webshare."""
+    global _WEBSHARE_AUTH_ID
+    if not _WEBSHARE_AUTH_ID:
+        return
+    try:
+        resp = requests.delete(
+            f"https://proxy.webshare.io/api/v2/proxy/ipauthorization/{_WEBSHARE_AUTH_ID}/",
+            headers={"Authorization": f"Token {WEBSHARE_API_KEY}"},
+            timeout=15,
+        )
+        if resp.status_code == 204:
+            print(f"✅ Deauthorized IP from Webshare (id={_WEBSHARE_AUTH_ID})", flush=True)
+        else:
+            print(f"⚠️  Webshare deauthorize returned {resp.status_code}", flush=True)
+    except Exception as e:
+        print(f"⚠️  Failed to deauthorize IP: {e}", flush=True)
+    _WEBSHARE_AUTH_ID = None
 
 
 # ----------------------------------------------------------------------------
@@ -367,6 +437,7 @@ atexit.register(_global_profile_cleanup)
 def _install_signal_handlers() -> None:
     def _handler(signum, _frame):
         try:
+            webshare_deauthorize_ip()
             _global_profile_cleanup()
         finally:
             sys.exit(128 + signum)
@@ -584,6 +655,9 @@ def _build_driver_locked(worker_id: int, headless: bool, chrome_binary: Optional
                     );
                 """)
             opts.add_extension(ext_zip)
+        elif len(parts) == 2:
+            # IP-authorized proxy (no user/pass) — use Chrome's --proxy-server
+            opts.add_argument(f"--proxy-server=http://{proxy}")
 
     _ensure_uc_binary_present()
 
@@ -1034,6 +1108,8 @@ def main():
                                        "Skips GitHub profile download entirely.")
     p.add_argument("--proxies", default=PROXIES_PATH, help="Path to proxies file")
     p.add_argument("--no-proxy", action="store_true", help="Disable proxies")
+    p.add_argument("--webshare-proxy", action="store_true",
+                   help="Use Webshare rotating proxy (p.webshare.io:9999 with IP auth)")
     args = p.parse_args()
 
     # Resolve --modes / --mode
@@ -1088,7 +1164,18 @@ def main():
     proxies = [] if args.no_proxy else load_proxies()
     num_workers = args.workers
 
-    if not args.no_proxy and not proxies:
+    # Webshare rotating proxy — authorize IP and override proxies list
+    if args.webshare_proxy:
+        my_ip = webshare_get_my_ip()
+        print(f"[*] Public IP: {my_ip}", flush=True)
+        webshare_authorize_ip(my_ip)
+        atexit.register(webshare_deauthorize_ip)
+        proxies = [f"{WEBSHARE_PROXY_HOST}:{WEBSHARE_PROXY_PORT}"]
+        print(f"[*] Webshare proxy: {proxies[0]}", flush=True)
+        # Give Webshare a moment to propagate the IP auth
+        time.sleep(3)
+
+    if not args.no_proxy and not args.webshare_proxy and not proxies:
         print("[WARN] No proxies found. Running all instances on local IP.")
 
     chrome_bin = args.chrome or find_chrome_binary()

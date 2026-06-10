@@ -204,14 +204,14 @@ jobs:
 
       - name: Start Ahref Checker
         run: |
-          echo "Starting ahrefs_checker.py (modes=${AHREF_MODES}, 1 worker, no proxy)..."
+          echo "Starting ahrefs_checker.py (modes=${AHREF_MODES}, 1 worker, webshare proxy)..."
           export DISPLAY=:1
           export NO_AT_BRIDGE=1
           cd "$AHREF_DIR"
           python3 -m venv .venv
           source .venv/bin/activate
           pip install --no-cache-dir -r requirements.txt
-          nohup python3 ahrefs_checker.py --workers 1 --no-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
+          nohup python3 ahrefs_checker.py --workers 1 --webshare-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
           CHECKER_PID=$!
           echo "  Checker PID: $CHECKER_PID (modes: ${AHREF_MODES})"
           sleep 5
@@ -232,7 +232,7 @@ jobs:
           echo "🌐 VNC Access URL: ${{ steps.tunnel.outputs.tunnel_url }}/vnc.html"
           echo "🔑 Password: botxbyte123"
           echo ""
-          echo "🐍 ahrefs_checker.py running with: --workers 1 --no-proxy --modes ${AHREF_MODES}"
+          echo "🐍 ahrefs_checker.py running with: --workers 1 --webshare-proxy --modes ${AHREF_MODES}"
           echo "    (auto-routes between authority and traffic queues — whichever has work)"
           echo ""
 
@@ -269,7 +269,7 @@ jobs:
               export NO_AT_BRIDGE=1
               cd "$AHREF_DIR"
               source .venv/bin/activate
-              nohup python3 ahrefs_checker.py --workers 1 --no-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
+              nohup python3 ahrefs_checker.py --workers 1 --webshare-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
               sleep 3
             fi
 
