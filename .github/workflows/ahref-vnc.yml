@@ -2,6 +2,16 @@ name: Ahref Checker VNC
 
 on:
   workflow_dispatch:
+    inputs:
+      modes:
+        description: 'Which checker(s) to run'
+        required: true
+        default: 'authority,traffic'
+        type: choice
+        options:
+          - authority,traffic
+          - authority
+          - traffic
 
 env:
   DISPLAY: ":1"
@@ -9,8 +19,7 @@ env:
   NOVNC_PORT: 6080
   VNC_PASSWORD: "botxbyte123"
   AHREF_DIR: "/home/runner/ahref-local"
-  # The script auto-routes between both queues — workflow doesn't pick.
-  AHREF_MODES: "authority,traffic"
+  AHREF_MODES: ${{ github.event.inputs.modes || 'authority,traffic' }}
 
 jobs:
   run:
