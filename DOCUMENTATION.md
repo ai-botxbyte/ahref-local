@@ -28,7 +28,7 @@ To upgrade chromium later: bump `CHROMIUM_VERSION` in `tools/setup_vendor.sh`, d
 ┌─────────────────────────────────────────────────────────┐
 │  Server (Kubernetes)                                     │
 │                                                          │
-│  Campaign created → ahref.authority-checker-queue        │
+│  Campaign created → ahref.authority-pool-queue           │
 │       ↑                              ↓                   │
 │  workflow.domain-final-queue    GET /ahref-authority/     │
 │       ↑                              ↓                   │
